@@ -66,6 +66,12 @@ impl Handle {
         Self::take_fixed_init_handle(huesos_abi::INIT_ACPI_BROKER_HANDLE)
     }
 
+    /// Take ownership of the firmware SCI `Irq` resource installed by the
+    /// kernel from the validated FADT policy.
+    pub fn take_init_acpi_sci_irq() -> Self {
+        Self::take_fixed_init_handle(huesos_abi::INIT_ACPI_SCI_IRQ_HANDLE)
+    }
+
     /// Take ownership of the `FrameDraw` capability installed only in the
     /// initial process by the kernel.
     ///

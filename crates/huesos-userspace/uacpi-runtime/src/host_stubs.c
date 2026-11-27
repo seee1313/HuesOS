@@ -1,5 +1,10 @@
+#include <stdint.h>
 #include <uacpi/kernel_api.h>
+#include <uacpi/namespace.h>
+#include <uacpi/notify.h>
 #include <uacpi/status.h>
+
+#include "hotplug.h"
 
 /*
  * AP-3 link-completeness boundary. Every host entry point required by the
@@ -332,6 +337,135 @@ void uacpi_kernel_unlock_spinlock(
 {
     (void)handle;
     (void)flags;
+}
+#endif
+
+#ifdef HUESOS_UACPI_RUST_WORK
+/*
+ * The Rust half owns the capability checks and the kernel Port/Interrupt
+ * objects. This C half owns only the opaque uACPI callback pointers: Rust
+ * never calls an untyped C function pointer directly. The fixed queue keeps
+ * SCI-to-GPE-to-Notify delivery bounded and allocation-free.
+ */
+extern uacpi_status hues_uacpi_irq_install(
+    uacpi_u32 irq, uacpi_handle *out_irq_handle);
+extern uacpi_status hues_uacpi_irq_uninstall(uacpi_handle irq_handle);
+extern int hues_uacpi_map_hotplug_node(
+    uacpi_namespace_node *node, HuesHotplugTarget *out_target);
+extern void hues_uacpi_notify_event(
+    HuesHotplugTarget target, uacpi_u64 value);
+
+#define HUES_WORK_QUEUE_MAX 64
+#define HUES_WORK_DRAIN_MAX 1024
+
+struct hues_work_item {
+    uacpi_work_handler handler;
+    uacpi_handle context;
+};
+
+static struct hues_work_item hues_work_queue[HUES_WORK_QUEUE_MAX];
+static uacpi_size hues_work_head;
+static uacpi_size hues_work_len;
+static uacpi_interrupt_handler hues_sci_handler;
+static uacpi_handle hues_sci_context;
+static uacpi_handle hues_sci_irq_handle;
+
+uacpi_status uacpi_kernel_install_interrupt_handler(
+    uacpi_u32 irq, uacpi_interrupt_handler handler, uacpi_handle context,
+    uacpi_handle *out_irq_handle)
+{
+    uacpi_status ret;
+
+    if (handler == UACPI_NULL || out_irq_handle == UACPI_NULL)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    ret = hues_uacpi_irq_install(irq, out_irq_handle);
+    if (ret != UACPI_STATUS_OK)
+        return ret;
+    hues_sci_handler = handler;
+    hues_sci_context = context;
+    hues_sci_irq_handle = *out_irq_handle;
+    return UACPI_STATUS_OK;
+}
+
+uacpi_status uacpi_kernel_uninstall_interrupt_handler(
+    uacpi_interrupt_handler handler, uacpi_handle irq_handle)
+{
+    uacpi_status ret;
+
+    if (handler == UACPI_NULL || irq_handle == UACPI_NULL)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    ret = hues_uacpi_irq_uninstall(irq_handle);
+    if (ret != UACPI_STATUS_OK)
+        return ret;
+    if (handler == hues_sci_handler && irq_handle == hues_sci_irq_handle) {
+        hues_sci_handler = UACPI_NULL;
+        hues_sci_context = UACPI_NULL;
+        hues_sci_irq_handle = UACPI_NULL;
+    }
+    return UACPI_STATUS_OK;
+}
+
+uacpi_status uacpi_kernel_schedule_work(
+    uacpi_work_type type, uacpi_work_handler handler, uacpi_handle context)
+{
+    uacpi_size tail;
+    (void)type;
+    if (handler == UACPI_NULL)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    if (hues_work_len >= HUES_WORK_QUEUE_MAX)
+        return UACPI_STATUS_OUT_OF_MEMORY;
+    tail = (hues_work_head + hues_work_len) % HUES_WORK_QUEUE_MAX;
+    hues_work_queue[tail].handler = handler;
+    hues_work_queue[tail].context = context;
+    hues_work_len++;
+    return UACPI_STATUS_OK;
+}
+
+uacpi_status uacpi_kernel_wait_for_work_completion(void)
+{
+    uacpi_size steps = 0;
+    while (hues_work_len != 0) {
+        struct hues_work_item item = hues_work_queue[hues_work_head];
+        hues_work_head = (hues_work_head + 1) % HUES_WORK_QUEUE_MAX;
+        hues_work_len--;
+        if (item.handler != UACPI_NULL)
+            item.handler(item.context);
+        steps++;
+        if (steps >= HUES_WORK_DRAIN_MAX)
+            return UACPI_STATUS_TIMEOUT;
+    }
+    return UACPI_STATUS_OK;
+}
+
+/* Called by the Rust Port pump after a real SCI packet was dequeued. */
+uacpi_status hues_uacpi_dispatch_sci(void)
+{
+    uacpi_status ret;
+    if (hues_sci_handler == UACPI_NULL)
+        return UACPI_STATUS_NOT_FOUND;
+    hues_sci_handler(hues_sci_context);
+    ret = uacpi_kernel_wait_for_work_completion();
+    return ret;
+}
+
+/* Root Notify callback: GPE execution remains entirely inside uACPI. */
+static uacpi_status hues_hotplug_notify(
+    uacpi_handle context, uacpi_namespace_node *node, uacpi_u64 value)
+{
+    HuesHotplugTarget target;
+    int status;
+    (void)context;
+    status = hues_uacpi_map_hotplug_node(node, &target);
+    if (status != 0 || target.valid == 0)
+        return UACPI_STATUS_INVALID_ARGUMENT;
+    hues_uacpi_notify_event(target, value);
+    return UACPI_STATUS_OK;
+}
+
+int hues_uacpi_install_hotplug_notify(void)
+{
+    return (int)uacpi_install_notify_handler(
+        uacpi_namespace_root(), hues_hotplug_notify, UACPI_NULL);
 }
 #endif
 

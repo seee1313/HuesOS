@@ -10,6 +10,34 @@ pub const HEADER_BYTES: usize = 32;
 /// Maximum encoded blob size.
 pub const MAX_ENCODED_BYTES: usize = HEADER_BYTES;
 
+/// Offset of the fixed NVMe DMA window in the boot DMA pool.
+pub const NVME_DMA_OFFSET: u64 = 0;
+/// Size of the fixed NVMe DMA window.
+pub const NVME_DMA_LEN: u64 = 64 * 1024 * 1024;
+/// Offset of the fixed virtio-net DMA window.
+pub const NET_DMA_OFFSET: u64 = NVME_DMA_OFFSET + NVME_DMA_LEN;
+/// Size of the fixed virtio-net DMA window.
+pub const NET_DMA_LEN: u64 = 4 * 1024 * 1024;
+/// Offset of the fixed WLAN DMA window.
+pub const WLAN_DMA_OFFSET: u64 = NET_DMA_OFFSET + NET_DMA_LEN;
+/// Size of the fixed WLAN DMA window.
+pub const WLAN_DMA_LEN: u64 = 4 * 1024 * 1024;
+/// Offset of the fixed xHCI DMA window.
+pub const XHCI_DMA_OFFSET: u64 = WLAN_DMA_OFFSET + WLAN_DMA_LEN;
+/// Size of the fixed xHCI DMA window.
+pub const XHCI_DMA_LEN: u64 = 4 * 1024 * 1024;
+/// Length of the fixed boot-device portion before live hotplug slices.
+pub const STATIC_DMA_POOL_LEN: u64 = XHCI_DMA_OFFSET + XHCI_DMA_LEN;
+/// Fixed offset of the live hotplug area inside the boot DMA pool.
+pub const HOTPLUG_DMA_OFFSET: u64 = STATIC_DMA_POOL_LEN;
+/// Size of one live hotplug DMA slice.
+pub const HOTPLUG_DMA_SLOT_LEN: u64 = 4 * 1024 * 1024;
+/// Number of kernel-defined live hotplug DMA slices.
+pub const HOTPLUG_DMA_SLOT_COUNT: usize = 4;
+/// Total kernel-reserved DMA pool length, including all live slices.
+pub const BOOT_DMA_POOL_LEN: u64 =
+    HOTPLUG_DMA_OFFSET + HOTPLUG_DMA_SLOT_LEN * HOTPLUG_DMA_SLOT_COUNT as u64;
+
 /// Storage boot-info header flag: a DMA pool was reserved.
 pub const FLAG_DMA_POOL_PRESENT: u32 = 1 << 0;
 /// Storage boot-info header flag: `init.storage=off` disabled storage.
@@ -49,7 +77,7 @@ pub struct DmaPoolInfo {
 impl DmaPoolInfo {
     /// Whether this descriptor names a non-empty pool.
     pub const fn is_present(&self) -> bool {
-        self.len != 0
+        self.base != 0 && self.len != 0
     }
 }
 
@@ -110,10 +138,30 @@ pub fn decode(bytes: &[u8]) -> Option<StorageBootInfo> {
     }
     let mut info = StorageBootInfo::empty();
     info.flags = read_u32(bytes, 12)?;
+    if info.flags & !(FLAG_DMA_POOL_PRESENT | FLAG_STORAGE_OFF) != 0 {
+        return None;
+    }
     info.dma_pool = DmaPoolInfo {
         base: read_u64(bytes, 16)?,
         len: read_u64(bytes, 24)?,
     };
+    let has_pool = (info.flags & FLAG_DMA_POOL_PRESENT) != 0;
+    if has_pool != info.dma_pool.is_present()
+        || (!has_pool && info.dma_pool.base != 0)
+        || (has_pool && info.dma_pool.len != BOOT_DMA_POOL_LEN)
+        || (has_pool && info.dma_pool.base >= (1u64 << 32))
+        || (has_pool
+            && info
+                .dma_pool
+                .base
+                .checked_add(info.dma_pool.len)
+                .is_none_or(|end| end > (1u64 << 32)))
+        || (info.dma_pool.base & 0xFFF) != 0
+        || (info.dma_pool.len != 0 && (info.dma_pool.len & 0xFFF) != 0)
+        || info.dma_pool.base.checked_add(info.dma_pool.len).is_none()
+    {
+        return None;
+    }
     Some(info)
 }
 
@@ -173,7 +221,7 @@ mod tests {
             flags: FLAG_DMA_POOL_PRESENT,
             dma_pool: DmaPoolInfo {
                 base: 0x1000_0000,
-                len: 0x400_0000,
+                len: BOOT_DMA_POOL_LEN,
             },
         }
     }
@@ -233,5 +281,51 @@ mod tests {
         write_u16(&mut bytes, 8, 64);
         write_u16(&mut bytes, 10, 1);
         assert!(decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn canonical_dma_geometry_is_contiguous() {
+        assert_eq!(NVME_DMA_OFFSET, 0);
+        assert_eq!(NET_DMA_OFFSET, NVME_DMA_LEN);
+        assert_eq!(WLAN_DMA_OFFSET, NET_DMA_OFFSET + NET_DMA_LEN);
+        assert_eq!(XHCI_DMA_OFFSET, WLAN_DMA_OFFSET + WLAN_DMA_LEN);
+        assert_eq!(STATIC_DMA_POOL_LEN, 76 * 1024 * 1024);
+        assert_eq!(HOTPLUG_DMA_OFFSET, STATIC_DMA_POOL_LEN);
+        assert_eq!(BOOT_DMA_POOL_LEN, 92 * 1024 * 1024);
+        assert_eq!(
+            BOOT_DMA_POOL_LEN,
+            STATIC_DMA_POOL_LEN + HOTPLUG_DMA_SLOT_LEN * HOTPLUG_DMA_SLOT_COUNT as u64
+        );
+    }
+
+    #[test]
+    fn rejects_flag_and_pool_presence_mismatch() {
+        let mut bytes = [0u8; MAX_ENCODED_BYTES];
+        let info = StorageBootInfo {
+            flags: 0,
+            dma_pool: DmaPoolInfo {
+                base: 0x1000,
+                len: 0x1000,
+            },
+        };
+        let Some(len) = encode(&info, &mut bytes) else {
+            assert!(false, "encode must fit fixed buffer");
+            return;
+        };
+        assert!(decode(&bytes[..len]).is_none());
+
+        let mut bytes = [0u8; MAX_ENCODED_BYTES];
+        let info = StorageBootInfo {
+            flags: FLAG_DMA_POOL_PRESENT,
+            dma_pool: DmaPoolInfo {
+                base: 0x1000,
+                len: 0,
+            },
+        };
+        let Some(len) = encode(&info, &mut bytes) else {
+            assert!(false, "encode must fit fixed buffer");
+            return;
+        };
+        assert!(decode(&bytes[..len]).is_none());
     }
 }

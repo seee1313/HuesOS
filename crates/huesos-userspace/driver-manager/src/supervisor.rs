@@ -8,9 +8,10 @@ use crate::protocol;
 use crate::protocol::MANIFEST_GRANTS_COMPLETE_PREFIX;
 use crate::registry::{ServiceRegistry, ServiceState};
 use crate::volume_service::VolumeManagerService;
+use core::fmt::Write as _;
 use huesos_abi::{
-    acpi_archive, acpi_manager, hmcf, key_broker, pci as abi_pci, pci_config, pci_inventory,
-    pci_iommu, pci_lease, pci_manager, pci_mediation, usb,
+    acpi_archive, acpi_manager, hmcf, key_broker, pci as abi_pci, pci_config, pci_hotplug,
+    pci_inventory, pci_iommu, pci_lease, pci_manager, pci_mediation, usb,
 };
 use libcanvas::{hbi_boot, println, storage_boot, Channel, ErrorCode, Handle, Process, Vmo};
 
@@ -57,6 +58,11 @@ impl BootDriverSpec {
 /// a private constant so the accumulator array size is a compile-time
 /// literal.
 const MAX_PENDING_RESOURCES_PER_DRIVER: usize = 12;
+/// Bounded number of live dynamically inserted NVMe DriverHosts.
+const MAX_HOTPLUG_HOSTS: usize = 4;
+/// PCI Manager transfers exactly BAR0, IRQ/polling, and DMA for an NVMe host.
+const HOTPLUG_RESOURCE_COUNT: usize = 3;
+const HOTPLUG_LABEL_CAP: usize = 96;
 
 /// Buffered resource handles + labels for one driver, waiting to be
 /// forwarded to that driver's bootstrap channel once its host process
@@ -186,11 +192,28 @@ pub struct DriverManager {
     /// Privileged userspace PCI Manager. PCI-9 starts it without physical
     /// config authority; no-root readiness is explicitly fail-closed.
     pci_manager: Option<ManagedHost>,
+    /// Boot-selftest-only ring-3 client that invokes syscall 98 through a
+    /// duplicate of the private ACPI-to-PCI write endpoint.
+    #[allow(dead_code)]
+    pci_hotplug_test: Option<ManagedHost>,
+    /// Pending and active live DriverHost handoffs keyed by DeviceLease
+    /// identity. These arrays are bounded so an event storm cannot turn
+    /// driver launch into an allocation path.
+    hotplug_pending: [Option<PendingHotplug>; MAX_HOTPLUG_HOSTS],
+    hotplug_hosts: [Option<HotplugHost>; MAX_HOTPLUG_HOSTS],
     pci_manager_generation: u64,
     pci_manager_restart: pci_manager::RestartBackoff,
     pci_manager_ready: bool,
     acpi_tables: Option<Vmo>,
     acpi_broker: Option<Handle>,
+    /// Duplicateable FADT SCI resource retained across ACPI manager restarts.
+    acpi_sci_irq: Option<Handle>,
+    /// Whether init has sent either the SCI resource or the explicit
+    /// no-SCI marker, so ACPI startup cannot race bootstrap delivery.
+    acpi_sci_settled: bool,
+    /// Peer of the private ACPI-to-PCI hotplug channel waiting for the
+    /// current PCI manager generation.
+    pci_hotplug_events: Option<Channel>,
     /// Immutable validated `HMCF` config-window snapshot retained for
     /// the current ACPI manager generation. Absent until one arrives;
     /// dropped on every manager restart so a stale generation can
@@ -217,6 +240,8 @@ pub struct DriverManager {
     config_authority_handed_off: bool,
     /// Whether the current PCI Manager generation received `DeviceLeaseAuthority`.
     pci_device_lease_handed_off: bool,
+    /// Whether boot DMA geometry was sent to the current PCI Manager generation.
+    pci_storage_boot_handed_off: bool,
     /// Whether the current PCI Manager generation reported
     /// [`pci_manager::Status::ConfigAuthorityReady`].
     pci_config_authority_ready: bool,
@@ -315,6 +340,95 @@ const PCI_MANAGER_RESTART_BASE_TICKS: u64 = 100;
 struct ManagedHost {
     process: Process,
     bootstrap: Channel,
+}
+
+struct HotplugLabel {
+    buf: [u8; HOTPLUG_LABEL_CAP],
+    len: usize,
+}
+
+impl HotplugLabel {
+    const fn new() -> Self {
+        Self {
+            buf: [0; HOTPLUG_LABEL_CAP],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl core::fmt::Write for HotplugLabel {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        let available = self.buf.len().saturating_sub(self.len);
+        if value.len() > available {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..self.len + value.len()].copy_from_slice(value.as_bytes());
+        self.len += value.len();
+        Ok(())
+    }
+}
+
+struct HotplugResourceSlot {
+    kind: pci_hotplug::HotplugResourceKind,
+    base: u64,
+    len: u64,
+    exclusive: bool,
+    handle: Option<Handle>,
+}
+
+impl HotplugResourceSlot {
+    const fn empty() -> Self {
+        Self {
+            kind: pci_hotplug::HotplugResourceKind::None,
+            base: 0,
+            len: 0,
+            exclusive: false,
+            handle: None,
+        }
+    }
+}
+
+struct PendingHotplug {
+    request: pci_hotplug::HotplugHandoff,
+    lease: Option<Handle>,
+    resources: [HotplugResourceSlot; HOTPLUG_RESOURCE_COUNT],
+}
+
+impl PendingHotplug {
+    fn new(request: pci_hotplug::HotplugHandoff, lease: Handle) -> Self {
+        Self {
+            request,
+            lease: Some(lease),
+            resources: [const { HotplugResourceSlot::empty() }; HOTPLUG_RESOURCE_COUNT],
+        }
+    }
+
+    fn resource_index(kind: pci_hotplug::HotplugResourceKind) -> Option<usize> {
+        match kind {
+            pci_hotplug::HotplugResourceKind::Mmio => Some(0),
+            pci_hotplug::HotplugResourceKind::Irq => Some(1),
+            pci_hotplug::HotplugResourceKind::DmaPool => Some(2),
+            pci_hotplug::HotplugResourceKind::None | pci_hotplug::HotplugResourceKind::Lease => {
+                None
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.lease.is_some() && self.resources.iter().all(|slot| slot.handle.is_some())
+    }
+}
+
+struct HotplugHost {
+    request: pci_hotplug::HotplugHandoff,
+    process: Process,
+    bootstrap: Channel,
+    lease: Handle,
+    ready_reported: bool,
 }
 
 fn parse_nvme_boot_driver_spec(bytes: &[u8]) -> Option<BootDriverSpec> {
@@ -435,11 +549,17 @@ impl DriverManager {
             acpi_namespace_initialized: false,
             acpi_hpci_eligible: false,
             pci_manager: None,
+            pci_hotplug_test: None,
+            hotplug_pending: [const { None }; MAX_HOTPLUG_HOSTS],
+            hotplug_hosts: [const { None }; MAX_HOTPLUG_HOSTS],
             pci_manager_generation: 0,
             pci_manager_restart: pci_manager::RestartBackoff::new(),
             pci_manager_ready: false,
             acpi_tables: None,
             acpi_broker: None,
+            acpi_sci_irq: None,
+            acpi_sci_settled: false,
+            pci_hotplug_events: None,
             hmcf: None,
             hpci: None,
             hiom: None,
@@ -448,6 +568,7 @@ impl DriverManager {
             device_lease_authority: None,
             config_authority_handed_off: false,
             pci_device_lease_handed_off: false,
+            pci_storage_boot_handed_off: false,
             pci_config_authority_ready: false,
             pci_roots_handed_off: false,
             pci_iommu_handed_off: false,
@@ -763,6 +884,7 @@ impl DriverManager {
             info.storage_off()
         );
         self.storage_boot = Some(info);
+        self.maybe_handoff_storage_boot_info();
         self.try_start_pending_hosts();
     }
 
@@ -896,7 +1018,10 @@ impl DriverManager {
             self.poll_acpi_manager();
             self.try_start_acpi_manager();
             self.poll_pci_manager();
+            self.poll_hotplug_hosts();
             self.try_start_pci_manager();
+            #[cfg(feature = "hotplug-test")]
+            self.poll_pci_hotplug_test();
             self.flush_storage_progress(&init_bootstrap);
             self.wait_until_active(&init_bootstrap);
         }
@@ -925,6 +1050,7 @@ impl DriverManager {
         push_ch(self.registry_channel.as_ref());
         push_ch(self.acpi_manager.as_ref().map(|h| &h.bootstrap));
         push_ch(self.pci_manager.as_ref().map(|h| &h.bootstrap));
+        push_ch(self.pci_hotplug_test.as_ref().map(|h| &h.bootstrap));
         push_ch(self.nvme_host.as_ref().map(|h| &h.bootstrap));
         push_ch(self.input_host.as_ref().map(|h| &h.bootstrap));
         push_ch(self.xhci_host.as_ref().map(|h| &h.bootstrap));
@@ -1359,6 +1485,114 @@ impl DriverManager {
         }
     }
 
+    fn handoff_pci_hotplug_events(&mut self) {
+        let transfer = {
+            let Some(channel) = self.pci_hotplug_events.as_ref() else {
+                return;
+            };
+            match channel.duplicate() {
+                Ok(channel) => channel,
+                Err(_) => {
+                    println!("[driver-manager] PCI hotplug event channel duplicate failed");
+                    self.schedule_pci_manager_restart();
+                    return;
+                }
+            }
+        };
+        let result = {
+            let Some(pci) = self.pci_manager.as_ref() else {
+                return;
+            };
+            pci.bootstrap.write_handle(
+                protocol::ACPI_MANAGER_HOTPLUG_EVENTS.as_bytes(),
+                transfer.into_handle(),
+            )
+        };
+        match result {
+            Ok(()) => println!("[driver-manager] forwarded private ACPI hotplug event channel"),
+            Err((error, _returned)) => {
+                println!(
+                    "[driver-manager] PCI hotplug event channel transfer failed: {}",
+                    error.as_str()
+                );
+                self.schedule_pci_manager_restart();
+            }
+        }
+    }
+
+    #[cfg(feature = "hotplug-test")]
+    fn start_pci_hotplug_test(&mut self, test_endpoint: Channel) {
+        let Some(bootfs) = self.fs.bootfs() else {
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry("/services/pci-hotplug-test.elf") else {
+            println!("[driver-manager] PCI hotplug syscall-98 test ELF missing");
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            return;
+        };
+        let Ok((process, bootstrap)) = libcanvas::process::spawn_elf_from_vmo(
+            "pci-hotplug-test",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+        ) else {
+            println!("[driver-manager] failed to launch PCI hotplug syscall-98 test");
+            return;
+        };
+        if let Err((error, _returned)) = bootstrap.write_handle(
+            pci_hotplug::HOTPLUG_TEST_CHANNEL_LABEL,
+            test_endpoint.into_handle(),
+        ) {
+            println!(
+                "[driver-manager] failed to transfer syscall-98 test endpoint: {}",
+                error.as_str()
+            );
+            // The probe has no useful work without the private endpoint. Do
+            // not leave an untracked process running across an ACPI/PCI
+            // generation restart; its bootstrap handle would otherwise keep
+            // the old endpoint alive and mask peer-close recovery.
+            let _ = process.terminate(-1);
+            return;
+        }
+        self.pci_hotplug_test = Some(ManagedHost { process, bootstrap });
+        println!("[driver-manager] launched ring-3 PCI hotplug syscall-98 test");
+    }
+
+    #[cfg(feature = "hotplug-test")]
+    fn poll_pci_hotplug_test(&mut self) {
+        let Some(host) = self.pci_hotplug_test.as_mut() else {
+            return;
+        };
+        let mut bytes = [0u8; 96];
+        let mut budget = POLL_BUDGET_PER_TICK;
+        loop {
+            budget = match budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return,
+            };
+            match host.bootstrap.read_into(&mut bytes) {
+                Ok(length) => {
+                    let result = match core::str::from_utf8(&bytes[..length]) {
+                        Ok(text) => text,
+                        Err(_) => "malformed result",
+                    };
+                    println!("[driver-manager] pci-hotplug-test: {}", result);
+                }
+                Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => return,
+                Err(error) => {
+                    println!(
+                        "[driver-manager] pci-hotplug-test finished: {}",
+                        error.as_str()
+                    );
+                    self.pci_hotplug_test = None;
+                    return;
+                }
+            }
+        }
+    }
+
     fn try_start_pci_manager(&mut self) {
         if self.pci_manager.is_some() || !self.bootfs_loaded {
             return;
@@ -1418,6 +1652,7 @@ impl DriverManager {
             self.schedule_pci_manager_restart();
             return;
         }
+        self.pci_storage_boot_handed_off = false;
         self.pci_manager_ready = false;
         self.pci_config_authority_ready = false;
         self.config_authority_handed_off = false;
@@ -1434,6 +1669,8 @@ impl DriverManager {
         }
         self.pci_bound_resources_len = 0;
         self.pci_manager = Some(ManagedHost { process, bootstrap });
+        self.maybe_handoff_storage_boot_info();
+        self.handoff_pci_hotplug_events();
         println!(
             "[driver-manager] launched restartable PCI manager generation {}",
             self.pci_manager_generation
@@ -1445,11 +1682,13 @@ impl DriverManager {
     }
 
     fn schedule_pci_manager_restart(&mut self) {
+        self.drop_hotplug_bindings();
         self.pci_manager = None;
         self.pci_manager_ready = false;
         self.pci_config_authority_ready = false;
         self.config_authority_handed_off = false;
         self.pci_device_lease_handed_off = false;
+        self.pci_storage_boot_handed_off = false;
         self.pci_roots_handed_off = false;
         self.pci_iommu_handed_off = false;
         self.pci_write_upgrade_requested = false;
@@ -1484,9 +1723,17 @@ impl DriverManager {
         );
     }
 
+    fn handoff_acpi_sci(&mut self) {
+        // The SCI is included in the next isolated manager bootstrap. A
+        // running generation owns its transferred duplicate already; a
+        // restart path calls this again after the old host is dropped.
+        self.try_start_acpi_manager();
+    }
+
     fn try_start_acpi_manager(&mut self) {
         if self.acpi_manager.is_some()
             || !self.bootfs_loaded
+            || !self.acpi_sci_settled
             || self.acpi_tables.is_none()
             || self.acpi_broker.is_none()
         {
@@ -1612,6 +1859,56 @@ impl DriverManager {
             return;
         }
 
+        if let Some(sci_source) = self.acpi_sci_irq.as_ref() {
+            let Ok(sci) = sci_source.duplicate(huesos_abi::rights::SAME_RIGHTS) else {
+                println!("[driver-manager] failed to duplicate FADT SCI resource");
+                self.schedule_acpi_manager_restart();
+                return;
+            };
+            if let Err((error, _sci)) =
+                bootstrap.write_handle(protocol::ACPI_MANAGER_SCI_IRQ.as_bytes(), sci)
+            {
+                println!(
+                    "[driver-manager] failed to transfer FADT SCI resource: {}",
+                    error.as_str()
+                );
+                self.schedule_acpi_manager_restart();
+                return;
+            }
+        } else if bootstrap
+            .write(protocol::ACPI_SCI_UNAVAILABLE.as_bytes())
+            .is_err()
+        {
+            println!("[driver-manager] failed to announce unavailable FADT SCI");
+            self.schedule_acpi_manager_restart();
+            return;
+        }
+
+        let Ok((pci_hotplug_end, acpi_hotplug_end)) = Channel::pair() else {
+            println!("[driver-manager] failed to create ACPI/PCI hotplug channel pair");
+            self.schedule_acpi_manager_restart();
+            return;
+        };
+        #[cfg(feature = "hotplug-test")]
+        if self.pci_hotplug_test.is_none() {
+            if let Ok(test_endpoint) = acpi_hotplug_end.duplicate() {
+                self.start_pci_hotplug_test(test_endpoint);
+            }
+        }
+        if let Err((error, _channel)) = bootstrap.write_handle(
+            protocol::ACPI_MANAGER_HOTPLUG_EVENTS.as_bytes(),
+            acpi_hotplug_end.into_handle(),
+        ) {
+            println!(
+                "[driver-manager] failed to transfer ACPI hotplug event channel: {}",
+                error.as_str()
+            );
+            self.schedule_acpi_manager_restart();
+            return;
+        }
+        self.pci_hotplug_events = Some(pci_hotplug_end);
+        self.handoff_pci_hotplug_events();
+
         self.acpi_manager_ready = false;
         self.acpi_namespace_initialized = false;
         self.acpi_hpci_eligible = false;
@@ -1629,11 +1926,22 @@ impl DriverManager {
 
     fn schedule_acpi_manager_restart(&mut self) {
         self.acpi_manager = None;
+        #[cfg(feature = "hotplug-test")]
+        if let Some(test) = self.pci_hotplug_test.take() {
+            // The probe owns a duplicate of the old ACPI endpoint. Close it
+            // with that generation so the next ACPI launch can receive a fresh
+            // duplicate instead of retaining a dead-channel test process.
+            let _ = test.process.terminate(-1);
+            drop(test);
+        }
         self.acpi_manager_ready = false;
         self.acpi_init_watchdog.disarm();
         self.acpi_namespace_initialized = false;
         self.acpi_hpci_eligible = false;
         self.config_mediation_established = false;
+        // The retained endpoint is paired with the old ACPI generation and
+        // must never be offered to a replacement PCI manager.
+        self.pci_hotplug_events = None;
         // A snapshot from the previous generation can never bind to the
         // next one; drop it so only a fresh validated HMCF remains. The
         // authority decision is undecided again until the next ACPI
@@ -1932,6 +2240,24 @@ impl DriverManager {
                     println!("[driver-manager] received unique ACPI broker capability");
                     self.acpi_broker = Some(handle);
                     self.try_start_acpi_manager();
+                }
+                Ok((n, Some(handle))) if &buf[..n] == protocol::ACPI_SCI_IRQ.as_bytes() => {
+                    if self.acpi_sci_settled || self.acpi_sci_irq.is_some() {
+                        println!("[driver-manager] duplicate ACPI SCI resource rejected");
+                        drop(handle);
+                    } else {
+                        println!("[driver-manager] received FADT SCI resource");
+                        self.acpi_sci_irq = Some(handle);
+                        self.acpi_sci_settled = true;
+                        self.handoff_acpi_sci();
+                    }
+                }
+                Ok((n, None)) if &buf[..n] == protocol::ACPI_SCI_UNAVAILABLE.as_bytes() => {
+                    if !self.acpi_sci_settled {
+                        self.acpi_sci_settled = true;
+                        println!("[driver-manager] FADT SCI unavailable; ACPI hotplug disabled");
+                        self.handoff_acpi_sci();
+                    }
                 }
                 Ok((n, Some(handle))) if &buf[..n] == protocol::KEY_BROKER_MANAGER.as_bytes() => {
                     if self.key_broker.is_some() {
@@ -3649,6 +3975,657 @@ impl DriverManager {
         }
     }
 
+    fn send_hotplug_response_on(
+        channel: &Channel,
+        request: pci_hotplug::HotplugHandoff,
+        status: pci_hotplug::HotplugHandoffStatus,
+        process_koid: u64,
+    ) {
+        let response = pci_hotplug::HotplugHandoff::response(request, status, process_koid);
+        let bytes = response.encode();
+        let _ = channel.write(&bytes);
+    }
+
+    fn revoke_hotplug_lease(lease: &Handle) {
+        if let Ok(info) = libcanvas::device_lease::query(lease) {
+            if info.revoked == 0 {
+                let _ = libcanvas::device_lease::revoke(
+                    lease,
+                    info.generation,
+                    pci_lease::revoke_flags::FAILED,
+                );
+            }
+        }
+    }
+
+    fn reject_pending_hotplug(
+        &mut self,
+        channel: &Channel,
+        pending: PendingHotplug,
+        status: pci_hotplug::HotplugHandoffStatus,
+    ) {
+        let request = pending.request;
+        if let Some(lease) = pending.lease.as_ref() {
+            Self::revoke_hotplug_lease(lease);
+        }
+        drop(pending);
+        Self::send_hotplug_response_on(channel, request, status, 0);
+    }
+
+    /// Reject a malformed message that nevertheless names a live pending
+    /// handoff. Protocol errors after `BindRequest` are terminal for that
+    /// generation: dropping only the newly received handle would strand the
+    /// lease and any earlier resources in `hotplug_pending`.
+    fn reject_pending_for_message(
+        &mut self,
+        channel: &Channel,
+        message: pci_hotplug::HotplugHandoff,
+        status: pci_hotplug::HotplugHandoffStatus,
+    ) -> bool {
+        let Some(slot) = self.hotplug_pending.iter().position(|pending| {
+            pending.as_ref().is_some_and(|pending| {
+                pending.request.manager_generation == message.manager_generation
+                    && pending.request.device_id == message.device_id
+                    && pending.request.lease_generation == message.lease_generation
+                    && pending.request.bdf == message.bdf
+                    && pending.request.driver == message.driver
+            })
+        }) else {
+            return false;
+        };
+        let Some(pending) = self.hotplug_pending[slot].take() else {
+            return false;
+        };
+        self.reject_pending_hotplug(channel, pending, status);
+        true
+    }
+
+    fn handle_hotplug_message(
+        &mut self,
+        channel: &Channel,
+        message: pci_hotplug::HotplugHandoff,
+        handle: Option<Handle>,
+    ) {
+        if message.manager_generation != self.pci_manager_generation {
+            if let Some(handle) = handle {
+                drop(handle);
+            }
+            Self::send_hotplug_response_on(
+                channel,
+                message,
+                pci_hotplug::HotplugHandoffStatus::Stale,
+                0,
+            );
+            return;
+        }
+        match message.op {
+            pci_hotplug::HotplugHandoffOp::BindRequest => {
+                let Some(lease) = handle else {
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Invalid,
+                        0,
+                    );
+                    return;
+                };
+                if message.driver != pci_hotplug::HotplugDriverKind::Nvme {
+                    drop(lease);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Unsupported,
+                        0,
+                    );
+                    return;
+                }
+                let valid_lease = libcanvas::device_lease::query(&lease)
+                    .ok()
+                    .is_some_and(|info| {
+                        info.revoked == 0
+                            && info.device_id == message.device_id
+                            && info.generation == message.lease_generation
+                            && info.pci_address_packed == message.bdf
+                    });
+                if !valid_lease {
+                    drop(lease);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Invalid,
+                        0,
+                    );
+                    return;
+                }
+                if self.hotplug_pending.iter().flatten().any(|pending| {
+                    pending.request.device_id == message.device_id
+                        && pending.request.lease_generation == message.lease_generation
+                }) || self.hotplug_hosts.iter().flatten().any(|host| {
+                    host.request.device_id == message.device_id
+                        && host.request.lease_generation == message.lease_generation
+                }) {
+                    drop(lease);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Busy,
+                        0,
+                    );
+                    return;
+                }
+                let Some(slot) = self.hotplug_pending.iter().position(Option::is_none) else {
+                    drop(lease);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Busy,
+                        0,
+                    );
+                    return;
+                };
+                self.hotplug_pending[slot] = Some(PendingHotplug::new(message, lease));
+                println!(
+                    "[driver-manager] hotplug bind request accepted device=0x{:x} generation={}",
+                    message.device_id, message.lease_generation
+                );
+            }
+            pci_hotplug::HotplugHandoffOp::BindResource => {
+                let Some(handle) = handle else {
+                    if !self.reject_pending_for_message(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Invalid,
+                    ) {
+                        Self::send_hotplug_response_on(
+                            channel,
+                            message,
+                            pci_hotplug::HotplugHandoffStatus::Invalid,
+                            0,
+                        );
+                    }
+                    return;
+                };
+                let Some(slot) = self.hotplug_pending.iter().position(|pending| {
+                    pending.as_ref().is_some_and(|pending| {
+                        pending.request.device_id == message.device_id
+                            && pending.request.lease_generation == message.lease_generation
+                            && pending.request.bdf == message.bdf
+                            && pending.request.driver == message.driver
+                    })
+                }) else {
+                    drop(handle);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Stale,
+                        0,
+                    );
+                    return;
+                };
+                let Some(resource_index) = PendingHotplug::resource_index(message.resource_kind)
+                else {
+                    drop(handle);
+                    if !self.reject_pending_for_message(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Invalid,
+                    ) {
+                        Self::send_hotplug_response_on(
+                            channel,
+                            message,
+                            pci_hotplug::HotplugHandoffStatus::Invalid,
+                            0,
+                        );
+                    }
+                    return;
+                };
+                let invalid_resource = self.hotplug_pending[slot].as_ref().is_none_or(|pending| {
+                    pending.resources[resource_index].handle.is_some()
+                        || message
+                            .resource_base
+                            .checked_add(message.resource_len)
+                            .is_none()
+                });
+                if invalid_resource {
+                    drop(handle);
+                    if !self.reject_pending_for_message(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Invalid,
+                    ) {
+                        Self::send_hotplug_response_on(
+                            channel,
+                            message,
+                            pci_hotplug::HotplugHandoffStatus::Invalid,
+                            0,
+                        );
+                    }
+                    return;
+                }
+                let Some(pending) = self.hotplug_pending[slot].as_mut() else {
+                    drop(handle);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Stale,
+                        0,
+                    );
+                    return;
+                };
+                let resource = &mut pending.resources[resource_index];
+                resource.kind = message.resource_kind;
+                resource.base = message.resource_base;
+                resource.len = message.resource_len;
+                resource.exclusive = message.resource_exclusive;
+                resource.handle = Some(handle);
+            }
+            pci_hotplug::HotplugHandoffOp::BindComplete => {
+                if let Some(handle) = handle {
+                    drop(handle);
+                    if !self.reject_pending_for_message(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Invalid,
+                    ) {
+                        Self::send_hotplug_response_on(
+                            channel,
+                            message,
+                            pci_hotplug::HotplugHandoffStatus::Invalid,
+                            0,
+                        );
+                    }
+                    return;
+                }
+                let Some(slot) = self.hotplug_pending.iter().position(|pending| {
+                    pending.as_ref().is_some_and(|pending| {
+                        pending.request.device_id == message.device_id
+                            && pending.request.lease_generation == message.lease_generation
+                            && pending.request.bdf == message.bdf
+                            && pending.request.driver == message.driver
+                    })
+                }) else {
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Stale,
+                        0,
+                    );
+                    return;
+                };
+                let complete = self.hotplug_pending[slot]
+                    .as_ref()
+                    .is_some_and(PendingHotplug::complete);
+                let Some(pending) = self.hotplug_pending[slot].take() else {
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Stale,
+                        0,
+                    );
+                    return;
+                };
+                if !complete {
+                    self.reject_pending_hotplug(
+                        channel,
+                        pending,
+                        pci_hotplug::HotplugHandoffStatus::Invalid,
+                    );
+                } else {
+                    self.launch_hotplug_host(channel, pending);
+                }
+            }
+            pci_hotplug::HotplugHandoffOp::RemoveRequest => {
+                if let Some(handle) = handle {
+                    drop(handle);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Invalid,
+                        0,
+                    );
+                    return;
+                }
+                if let Some(slot) = self.hotplug_pending.iter().position(|pending| {
+                    pending.as_ref().is_some_and(|pending| {
+                        pending.request.manager_generation == message.manager_generation
+                            && pending.request.device_id == message.device_id
+                            && pending.request.lease_generation == message.lease_generation
+                            && pending.request.bdf == message.bdf
+                            && pending.request.driver == message.driver
+                    })
+                }) {
+                    let Some(pending) = self.hotplug_pending[slot].take() else {
+                        Self::send_hotplug_response_on(
+                            channel,
+                            message,
+                            pci_hotplug::HotplugHandoffStatus::Stale,
+                            0,
+                        );
+                        return;
+                    };
+                    if let Some(lease) = pending.lease.as_ref() {
+                        Self::revoke_hotplug_lease(lease);
+                    }
+                    drop(pending);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Ok,
+                        0,
+                    );
+                    return;
+                }
+                if let Some(slot) = self.hotplug_hosts.iter().position(|host| {
+                    host.as_ref().is_some_and(|host| {
+                        host.request.manager_generation == message.manager_generation
+                            && host.request.device_id == message.device_id
+                            && host.request.lease_generation == message.lease_generation
+                            && host.request.bdf == message.bdf
+                            && host.request.driver == message.driver
+                    })
+                }) {
+                    let Some(host) = self.hotplug_hosts[slot].take() else {
+                        Self::send_hotplug_response_on(
+                            channel,
+                            message,
+                            pci_hotplug::HotplugHandoffStatus::Stale,
+                            0,
+                        );
+                        return;
+                    };
+                    let _ = host.process.terminate(0);
+                    Self::revoke_hotplug_lease(&host.lease);
+                    drop(host);
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Ok,
+                        0,
+                    );
+                } else {
+                    Self::send_hotplug_response_on(
+                        channel,
+                        message,
+                        pci_hotplug::HotplugHandoffStatus::Stale,
+                        0,
+                    );
+                }
+            }
+            pci_hotplug::HotplugHandoffOp::BindResponse
+            | pci_hotplug::HotplugHandoffOp::RemoveResponse => {
+                if let Some(handle) = handle {
+                    drop(handle);
+                }
+            }
+        }
+    }
+
+    fn launch_hotplug_host(&mut self, channel: &Channel, mut pending: PendingHotplug) {
+        let request = pending.request;
+        let Some(host_slot) = self.hotplug_hosts.iter().position(Option::is_none) else {
+            self.reject_pending_hotplug(channel, pending, pci_hotplug::HotplugHandoffStatus::Busy);
+            return;
+        };
+        let attach_ok = match (pending.lease.as_ref(), pending.resources[2].handle.as_ref()) {
+            (Some(lease), Some(dma)) => {
+                libcanvas::device_lease::attach_dma(lease, dma, request.lease_generation).is_ok()
+            }
+            _ => false,
+        };
+        if !attach_ok {
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Failed,
+            );
+            return;
+        }
+        let Some(spec) = self.nvme_boot_driver else {
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Unsupported,
+            );
+            return;
+        };
+        let Some(bootfs) = self.fs.bootfs() else {
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Failed,
+            );
+            return;
+        };
+        let Some(bootfs_vmo) = self.fs.vmo() else {
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Failed,
+            );
+            return;
+        };
+        let Ok(Some(entry)) = bootfs.get_entry(spec.elf_path()) else {
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Unsupported,
+            );
+            return;
+        };
+        let Ok((process, child)) = libcanvas::process::spawn_elf_from_vmo(
+            "driver-host-nvme-hotplug",
+            bootfs_vmo,
+            entry.offset,
+            entry.len,
+        ) else {
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Failed,
+            );
+            return;
+        };
+        let Ok(process_koid) = process.koid() else {
+            let _ = process.terminate(-1);
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Failed,
+            );
+            return;
+        };
+        let Some(lease_ro) = pending.lease.as_ref().and_then(|lease| {
+            lease
+                .duplicate(libcanvas::rights::READ | libcanvas::rights::TRANSFER)
+                .ok()
+        }) else {
+            let _ = process.terminate(-1);
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Failed,
+            );
+            return;
+        };
+        if let Err((_error, _returned)) =
+            child.write_handle(pci_manager::DEVICE_LEASE_NVME_RO_LABEL, lease_ro)
+        {
+            let _ = process.terminate(-1);
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Failed,
+            );
+            return;
+        }
+        for resource_index in 0..pending.resources.len() {
+            let (kind, base, len, exclusive) = {
+                let resource = &pending.resources[resource_index];
+                (
+                    resource.kind,
+                    resource.base,
+                    resource.len,
+                    resource.exclusive,
+                )
+            };
+            let Some(handle) = pending.resources[resource_index].handle.take() else {
+                let _ = process.terminate(-1);
+                self.reject_pending_hotplug(
+                    channel,
+                    pending,
+                    pci_hotplug::HotplugHandoffStatus::Invalid,
+                );
+                return;
+            };
+            let mut label = HotplugLabel::new();
+            let kind_name = match kind {
+                pci_hotplug::HotplugResourceKind::Mmio => "mmio",
+                pci_hotplug::HotplugResourceKind::Irq => "irq",
+                pci_hotplug::HotplugResourceKind::DmaPool => "dma",
+                _ => "invalid",
+            };
+            let _ = write!(
+                label,
+                "resource:driver-host-nvme:{}:{:#x}:{:#x}:{}",
+                kind_name,
+                base,
+                len,
+                if exclusive { "excl" } else { "shared" }
+            );
+            match child.write_handle(label.as_bytes(), handle) {
+                Ok(()) => {}
+                Err((error, returned)) => {
+                    pending.resources[resource_index].handle = Some(returned);
+                    println!(
+                        "[driver-manager] hotplug resource transfer failed: {}",
+                        error.as_str()
+                    );
+                    let _ = process.terminate(-1);
+                    self.reject_pending_hotplug(
+                        channel,
+                        pending,
+                        pci_hotplug::HotplugHandoffStatus::Failed,
+                    );
+                    return;
+                }
+            }
+        }
+        if child
+            .write(protocol::RESOURCE_TRANSFER_COMPLETE.as_bytes())
+            .is_err()
+        {
+            let _ = process.terminate(-1);
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Failed,
+            );
+            return;
+        }
+        let Some(lease) = pending.lease.take() else {
+            let _ = process.terminate(-1);
+            self.reject_pending_hotplug(
+                channel,
+                pending,
+                pci_hotplug::HotplugHandoffStatus::Invalid,
+            );
+            return;
+        };
+        self.hotplug_hosts[host_slot] = Some(HotplugHost {
+            request,
+            process,
+            bootstrap: child,
+            lease,
+            ready_reported: false,
+        });
+        println!(
+            "[driver-manager] launched live NVMe DriverHost device=0x{:x} process={}",
+            request.device_id, process_koid
+        );
+    }
+
+    fn poll_hotplug_hosts(&mut self) {
+        for slot in 0..MAX_HOTPLUG_HOSTS {
+            let Some(mut host) = self.hotplug_hosts[slot].take() else {
+                continue;
+            };
+            let mut failed = false;
+            let mut buffer = [0u8; 128];
+            let mut budget = POLL_BUDGET_PER_TICK;
+            while budget != 0 {
+                budget -= 1;
+                match host.bootstrap.read_into(&mut buffer) {
+                    Ok(length) => {
+                        let message = &buffer[..length];
+                        if message == b"driver-host:nvme:ready" && !host.ready_reported {
+                            host.ready_reported = true;
+                            let koid = host.process.koid().unwrap_or(0);
+                            if let Some(manager) = self.pci_manager.as_ref() {
+                                Self::send_hotplug_response_on(
+                                    &manager.bootstrap,
+                                    host.request,
+                                    pci_hotplug::HotplugHandoffStatus::Ok,
+                                    koid,
+                                );
+                            }
+                            println!(
+                                "[driver-manager] live NVMe DriverHost ready device=0x{:x} koid={}",
+                                host.request.device_id, koid
+                            );
+                        } else if message == b"service:block:nvme:bringup-failed" {
+                            failed = true;
+                            break;
+                        }
+                    }
+                    Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => break,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if !failed && host.process.poll_exit().ok().flatten().is_some() {
+                failed = true;
+            }
+            if failed {
+                if let Some(manager) = self.pci_manager.as_ref() {
+                    Self::send_hotplug_response_on(
+                        &manager.bootstrap,
+                        host.request,
+                        pci_hotplug::HotplugHandoffStatus::Failed,
+                        0,
+                    );
+                }
+                let _ = host.process.terminate(-1);
+                Self::revoke_hotplug_lease(&host.lease);
+                println!(
+                    "[driver-manager] live NVMe DriverHost failed device=0x{:x}",
+                    host.request.device_id
+                );
+            } else {
+                self.hotplug_hosts[slot] = Some(host);
+            }
+        }
+    }
+
+    fn drop_hotplug_bindings(&mut self) {
+        for pending in &mut self.hotplug_pending {
+            if let Some(pending) = pending.take() {
+                if let Some(lease) = pending.lease.as_ref() {
+                    Self::revoke_hotplug_lease(lease);
+                }
+                drop(pending);
+            }
+        }
+        for host in &mut self.hotplug_hosts {
+            if let Some(host) = host.take() {
+                let _ = host.process.terminate(-1);
+                Self::revoke_hotplug_lease(&host.lease);
+                drop(host);
+            }
+        }
+    }
+
     fn poll_pci_manager(&mut self) {
         let Some(host) = self.pci_manager.take() else {
             return;
@@ -3659,7 +4636,23 @@ impl DriverManager {
             match host.bootstrap.read_optional_handle(&mut bytes) {
                 Ok((length, Some(handle))) => {
                     let label = &bytes[..length];
-                    if label == pci_manager::DEVICE_LEASE_RO_LABEL {
+                    if let Some(message) = pci_hotplug::HotplugHandoff::decode(label) {
+                        self.handle_hotplug_message(&host.bootstrap, message, Some(handle));
+                    } else if label.len() == pci_hotplug::HANDOFF_MESSAGE_BYTES
+                        && label[..4] == pci_hotplug::HANDOFF_MAGIC.to_le_bytes()
+                    {
+                        // A malformed handoff cannot be matched safely to a
+                        // pending identity. Drop the received capability and
+                        // rebuild the generation so every previously retained
+                        // lease/resource is cleaned up by the bounded restart
+                        // path instead of being stranded in FIFO state.
+                        drop(handle);
+                        println!(
+                            "[driver-manager] malformed PCI hotplug handoff; restarting generation"
+                        );
+                        self.schedule_pci_manager_restart();
+                        return;
+                    } else if label == pci_manager::DEVICE_LEASE_RO_LABEL {
                         if libcanvas::device_lease::query(&handle).is_ok()
                             && self.pci_bound_leases_len < self.pci_bound_leases.len()
                         {
@@ -3721,6 +4714,20 @@ impl DriverManager {
                     continue;
                 }
                 Ok((length, None)) => {
+                    if let Some(message) = pci_hotplug::HotplugHandoff::decode(&bytes[..length]) {
+                        self.handle_hotplug_message(&host.bootstrap, message, None);
+                        self.pci_manager = Some(host);
+                        return;
+                    }
+                    if length == pci_hotplug::HANDOFF_MESSAGE_BYTES
+                        && bytes[..4] == pci_hotplug::HANDOFF_MAGIC.to_le_bytes()
+                    {
+                        println!(
+                            "[driver-manager] malformed PCI hotplug handoff; restarting generation"
+                        );
+                        self.schedule_pci_manager_restart();
+                        return;
+                    }
                     let Some(message) = pci_manager::decode(&bytes[..length]) else {
                         println!("[driver-manager] malformed PCI manager control message");
                         self.schedule_pci_manager_restart();
@@ -4074,6 +5081,7 @@ impl DriverManager {
                         }
                         self.config_authority_handed_off = true;
                         self.pci_manager = Some(host);
+                        self.maybe_handoff_storage_boot_info();
                         self.maybe_handoff_device_lease_authority();
                         if force_legacy {
                             println!(
@@ -4117,6 +5125,7 @@ impl DriverManager {
     }
 
     fn maybe_handoff_device_lease_authority(&mut self) {
+        self.maybe_handoff_storage_boot_info();
         if !self.config_authority_handed_off || self.pci_device_lease_handed_off {
             return;
         }
@@ -4150,6 +5159,41 @@ impl DriverManager {
         }
     }
 
+    fn maybe_handoff_storage_boot_info(&mut self) {
+        if self.pci_storage_boot_handed_off {
+            return;
+        }
+        let Some(info) = self.storage_boot else {
+            return;
+        };
+        let Some(host) = self.pci_manager.as_ref() else {
+            return;
+        };
+        let prefix_len = pci_manager::STORAGE_BOOT_INFO_LABEL.len();
+        let mut message = [0u8; 64];
+        message[..prefix_len].copy_from_slice(pci_manager::STORAGE_BOOT_INFO_LABEL);
+        let Some(payload_len) = storage_boot::encode(&info, &mut message[prefix_len..]) else {
+            println!("[driver-manager] PCI manager storage DMA metadata encode failed");
+            return;
+        };
+        let total = prefix_len + payload_len;
+        match host.bootstrap.write(&message[..total]) {
+            Ok(()) => {
+                self.pci_storage_boot_handed_off = true;
+                println!(
+                    "[driver-manager] forwarded storage DMA metadata to PCI manager generation {}",
+                    self.pci_manager_generation
+                );
+            }
+            Err(error) => {
+                println!(
+                    "[driver-manager] PCI manager storage DMA metadata delivery failed: {:?}",
+                    error
+                );
+            }
+        }
+    }
+
     /// Send the explicit zero-capability sentinel so the PCI Manager
     /// can settle into its fail-closed state. Delivery failure is not
     /// fatal: the child already reported fail-closed readiness and
@@ -4162,6 +5206,7 @@ impl DriverManager {
         }
         self.config_authority_handed_off = true;
         self.pci_manager = Some(host);
+        self.maybe_handoff_storage_boot_info();
         self.pci_bindings_settled = true;
         if !self.storage_off && self.nvme_lease_ro.is_none() {
             self.storage_skipped_pending = true;

@@ -14,10 +14,11 @@ const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
 const MEMMAP_ACPI_NVS: u64 = 3;
 /// Some Limine builds also expose this as type 8 (ACPI tables / mapped reserved).
 const MEMMAP_ACPI_TABLES_OR_MAPPED_RESERVED: u64 = 8;
-/// Stage-A storage + network/WLAN/USB target: 76 MiB physically contiguous `< 4 GiB`
-/// DMA pool (`[0..64 MiB)` NVMe, `[64..68 MiB)` virtio-net, `[68..72 MiB)` rtw88,
-/// `[72..76 MiB)` xHCI USB 3.x).
-const BOOT_DMA_POOL_LEN: u64 = 76 * 1024 * 1024;
+/// Stage-A storage + network/WLAN/USB target plus four bounded live-hotplug
+/// slices: the ABI-defined physically contiguous `< 4 GiB` DMA pool
+/// (`[0..64 MiB)` NVMe, `[64..68 MiB)` virtio-net, `[68..72 MiB)` rtw88,
+/// `[72..76 MiB)` xHCI USB 3.x, `[76..92 MiB)` live NVMe hotplug).
+const BOOT_DMA_POOL_LEN: u64 = huesos_abi::storage_boot::BOOT_DMA_POOL_LEN;
 /// Prefer a 2 MiB-aligned base so later huge-page/IOMMU mappings can reuse the
 /// same aperture without moving the pool.
 const BOOT_DMA_POOL_ALIGN: u64 = 2 * 1024 * 1024;
@@ -60,7 +61,8 @@ pub fn reserve_boot_dma_pool() -> Option<BootDmaPool> {
             let mut writer = huesos_arch::serial::SerialWriter;
             let _ = writeln!(
                 writer,
-                "[storage] 64 MiB boot DMA pool unavailable: {error:?}"
+                "[storage] {} MiB boot DMA pool unavailable: {error:?}",
+                BOOT_DMA_POOL_LEN / (1024 * 1024)
             );
             return None;
         }

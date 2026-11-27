@@ -12,6 +12,15 @@ pub const TABLES_VMO_LABEL: &[u8] = b"acpi-tables-vmo";
 pub const BROKER_LABEL: &[u8] = b"acpi-broker";
 /// DriverManager transfers the child process's own root VMAR with this label.
 pub const SELF_VMAR_LABEL: &[u8] = b"acpi-self-vmar";
+/// DriverManager transfers the kernel-minted FADT SCI resource with this label.
+pub const SCI_IRQ_LABEL: &[u8] = b"acpi-sci-irq";
+/// DriverManager sends this plain marker when the validated ACPI snapshot has
+/// no usable SCI IRQ. The manager remains alive but cannot receive hardware
+/// hotplug notifications.
+pub const SCI_UNAVAILABLE_LABEL: &[u8] = b"acpi-sci-unavailable";
+/// DriverManager transfers the private ACPI-to-PCI hotplug event channel with
+/// this label.
+pub const HOTPLUG_EVENTS_LABEL: &[u8] = b"pci-hotplug-events";
 /// `acpi-manager` transfers the validated `HMCF` config-window snapshot with
 /// this label. The VMO carries `READ | DUPLICATE | TRANSFER` rights only;
 /// it is immutable from every published handle.

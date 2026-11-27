@@ -41,7 +41,7 @@ Following the microkernel policy-crate architecture enforced by
      allocations occur at bring-up or steady state; `XhciController` (`< 11 KiB`)
      lives inline in `.bss` with zero shadow ring arrays.
    - Receives `BAR0` `Mmio`, MSI-X/MSI `Irq` (vector `0xE0`), a dedicated `4 MiB`
-     `< 4 GiB` `DmaPool` (`[72..76 MiB)` in `BOOT_DMA_POOL_LEN = 76 MiB`), and a
+     `< 4 GiB` `DmaPool` (`[72..76 MiB)` in `BOOT_DMA_POOL_LEN = 92 MiB`), and a
      read-only `DeviceLease` (`DEVICE_LEASE_XHCI_RO_LABEL`).
    - `driver-manager` attaches the `4 MiB` `DmaPool` to `xhci_lease_rw` via
      `DeviceLease::attach_dma` before forwarding `resource:transfer-complete`,

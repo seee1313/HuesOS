@@ -82,6 +82,15 @@ pub(crate) fn sys_resource_create(
     // at mint time so overlap-checked collisions deterministically
     // fire only on genuine double-mint attempts. Every other kind
     // keeps the caller-supplied range.
+    if kernel_kind == ResourceKind::DmaPool
+        && (!huesos_object::dma_pool_range_owned(base, len)
+            || huesos_object::range_overlaps_dynamic_area(base, len))
+    {
+        // Unbound DmaPool resources are the fixed boot grants. The dynamic
+        // hotplug area can only be entered through a lease-bound slot claim.
+        return Err(ErrorCode::AccessDenied);
+    }
+
     let (mint_base, mint_len) = if matches!(
         kernel_kind,
         ResourceKind::PowerControl

@@ -56,6 +56,14 @@ Rank tracking starts after `init_gs_base`. HuesOS deliberately keeps pre-GS seri
 
 `huesos-pmm` is an intentional exception to the ranked-lock migration. It runs before `init_gs_base` on the BSP (the PMM must exist before any per-CPU state can be allocated) and is exercised by host tests that cannot execute per-CPU GS machinery. Instead of `RankedIrqSafeTicketLock`, the PMM uses `spin::Mutex` wrapped in a crate-local `IrqGuard` that masks local interrupts around every `lock()` call. This closes the concrete deadlock "IRQ-context path re-enters `alloc_frame` while the same CPU already holds the PMM lock" without dragging the ranked-lock machinery into a host-testable crate. See `docs/UNSAFE_AUDIT.md § "PMM IRQ-guard boundary"` for the safety-budget review of the two new `asm!` sites.
 
+## DeviceLease/IOMMU callback boundary
+
+The object-layer `DeviceLease::inner` lock is an IRQ-safe object-local lock, not a ranked architecture lock. `attach_dma_range()` intentionally holds it while invoking the registered `IommuLeaseHooks::bind_dma` callback; this is the serialization point that prevents `revoke()` or `Drop` from releasing a dynamic DMA slot while a bind is still programming the corresponding IOMMU domain. Lease-bound `Resource` construction uses the same lock while it claims a dynamic slot and commits the resource to the registry. The registry's existing-resource scan reads the lock-free `active_generation` publication rather than reacquiring `DeviceLease::inner`, so that transaction does not create a registry → lease → registry inversion. The acquisition order is:
+
+`DeviceLease::inner` → dynamic DMA-pool state / `REGISTRY` → `IOMMU_LEASE_HOOKS` → architecture IOMMU state (`VTD_STATE` or `AMD_VI_STATE`).
+
+The architecture callbacks must not call back into `DeviceLease` or any API that waits for `DeviceLease::inner`. The installed VT-d and AMD-Vi callbacks only take their architecture state lock and perform bounded hardware work. `revoke()` and `Drop` release `DeviceLease::inner` before taking the hook/architecture locks, so there is no reverse edge. They tear down the IOMMU domain before releasing the lease-generation-owned dynamic DMA slots. This callback contract is stated on `IommuBindDmaFn` and is part of the review surface for any future hook implementation.
+
 ## Review checklist
 
 For every new lock or acquisition:

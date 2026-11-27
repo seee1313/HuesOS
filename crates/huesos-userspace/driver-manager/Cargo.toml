@@ -8,6 +8,9 @@ default = []
 acpi-restart-smoke = []
 acpi-restart-budget-smoke = []
 key-broker-fail-smoke = []
+# Boot-selftest launches the separate ring-3 syscall-98 hotplug probe after
+# the private ACPI/PCI endpoint has been duplicated.
+hotplug-test = []
 # AP-10 conformance knob: mint the legacy CF8/CFC authority instead of
 # ECAM windows and announce the legacy backend in the PCI manager hello.
 pci-force-legacy = []

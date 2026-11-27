@@ -151,7 +151,7 @@ pub enum RootCollectError {
 }
 
 /// Deterministic root identity bound to `(snapshot_id, segment, start_bus, end_bus)`.
-fn canonical_root_id(snapshot_id: u64, segment: u16, start_bus: u8, end_bus: u8) -> u64 {
+pub(crate) fn canonical_root_id(snapshot_id: u64, segment: u16, start_bus: u8, end_bus: u8) -> u64 {
     let mut x = snapshot_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ (u64::from(segment) << 16)
         ^ (u64::from(start_bus) << 8)

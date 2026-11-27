@@ -11,10 +11,11 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::irq_guard::IrqSafeMutex;
 use crate::wait::WaitQueue;
-use crate::{alloc_koid, KernelObject, Koid, ObjectType, Port, PortPacket};
+use crate::{alloc_koid, KernelObject, Koid, ObjectType, Port, PortPacket, ResourceError};
 
 /// Port packet type matching `huesos_abi::PORT_PACKET_DEVICE_GONE`.
 pub const PORT_PACKET_DEVICE_GONE: u32 = 5;
@@ -72,6 +73,14 @@ pub enum DeviceLeaseError {
 }
 
 /// Ring-0 hook mapping `[base, base + len)` into `(pci_address_packed, lease_koid, generation)`.
+///
+/// The callback is invoked while the lease's lifecycle mutex is held. It must
+/// be non-reentrant: it may take architecture/IOMMU state locks and perform
+/// synchronous hardware work, but must not call back into this `DeviceLease`
+/// (or any operation that waits for the same lease mutex). On an error it
+/// must either leave no mapping or tolerate the immediate idempotent teardown
+/// callback issued by `attach_dma_range()`. The installed architecture hooks
+/// satisfy this contract and do not inspect object-layer lease state.
 pub type IommuBindDmaFn = fn(u64, u64, u64, u64, u64) -> Result<(), DeviceLeaseError>;
 /// Ring-0 hook synchronously tearing down `(pci_address_packed, lease_koid, generation)`.
 pub type IommuTeardownFn = fn(u64, u64, u64);
@@ -106,6 +115,10 @@ pub struct DeviceLease {
     device_id: u64,
     firmware_snapshot_id: u64,
     inner: IrqSafeMutex<DeviceLeaseInner>,
+    /// Lock-free active-generation observation used while the object registry
+    /// scans bound resources. It avoids acquiring `inner` under the registry
+    /// lock; lifecycle writers update it while holding `inner`.
+    active_generation: AtomicU64,
     waiters: WaitQueue,
 }
 
@@ -131,6 +144,7 @@ impl DeviceLease {
                 iommu_bound: false,
                 gone_ports: Vec::new(),
             }),
+            active_generation: AtomicU64::new(1),
             waiters: WaitQueue::new(),
         });
         crate::register_object(Arc::clone(&lease) as Arc<dyn KernelObject>);
@@ -150,15 +164,38 @@ impl DeviceLease {
     /// Return `true` iff `expected_generation` matches the live generation and
     /// the lease has not been revoked.
     pub fn is_generation_active(&self, expected_generation: u64) -> bool {
-        if expected_generation == 0 {
-            return false;
-        }
+        expected_generation != 0
+            && self.active_generation.load(Ordering::Acquire) == expected_generation
+    }
+
+    /// Run a bound-resource transaction while the lease generation remains
+    /// active. The callback may claim a dynamic DMA slot and register the
+    /// child resource; `revoke()` cannot invalidate or release that claim
+    /// until the callback returns.
+    ///
+    /// The registry observes `active_generation` atomically rather than
+    /// taking `inner`, so this lock order does not create a registry-to-lease
+    /// inversion while existing resources are scanned.
+    pub(crate) fn with_active_generation<T, F>(
+        &self,
+        expected_generation: u64,
+        operation: F,
+    ) -> Result<T, ResourceError>
+    where
+        F: FnOnce() -> Result<T, ResourceError>,
+    {
         let inner = self.inner.lock();
-        inner.generation == expected_generation
-            && matches!(
+        if expected_generation == 0
+            || inner.generation != expected_generation
+            || !matches!(
                 inner.state,
                 DeviceLeaseState::Configured | DeviceLeaseState::Online
             )
+            || self.active_generation.load(Ordering::Acquire) != expected_generation
+        {
+            return Err(ResourceError::Conflict);
+        }
+        operation()
     }
 
     /// Return `true` if the lease has been revoked (`Removing`/`Removed`/`Failed`).
@@ -235,51 +272,41 @@ impl DeviceLease {
         {
             return Err(DeviceLeaseError::InvalidArgs);
         }
-        let pci_address_packed = {
-            let inner = self.inner.lock();
-            if inner.generation != expected_generation
-                || !matches!(
-                    inner.state,
-                    DeviceLeaseState::Configured | DeviceLeaseState::Online
-                )
-            {
-                return Err(DeviceLeaseError::StaleOrRevoked);
-            }
-            inner.pci_address_packed
-        };
-
+        // Serialize the hardware bind with revoke/drop. If the lock were
+        // released while the architecture hook ran, revoke could release the
+        // dynamic DMA slot and a replacement lease could reuse it before this
+        // stale bind was torn down. The architecture hooks do not call back
+        // into DeviceLease, so keeping this short critical section held is
+        // safe and gives the bind/revoke pair a single ordering point.
+        let mut inner = self.inner.lock();
+        if inner.generation != expected_generation
+            || !matches!(
+                inner.state,
+                DeviceLeaseState::Configured | DeviceLeaseState::Online
+            )
+        {
+            return Err(DeviceLeaseError::StaleOrRevoked);
+        }
+        let pci_address_packed = inner.pci_address_packed;
         let hooks = *IOMMU_LEASE_HOOKS.lock();
         if let Some(h) = hooks {
-            (h.bind_dma)(
+            if let Err(error) = (h.bind_dma)(
                 pci_address_packed,
                 self.koid.0,
                 expected_generation,
                 base,
                 len,
-            )?;
-        }
-
-        let still_active = {
-            let mut inner = self.inner.lock();
-            if inner.generation == expected_generation
-                && matches!(
-                    inner.state,
-                    DeviceLeaseState::Configured | DeviceLeaseState::Online
-                )
-            {
-                inner.iommu_bound = true;
-                true
-            } else {
-                false
-            }
-        };
-
-        if !still_active {
-            if let Some(h) = hooks {
+            ) {
+                // A hook may have installed part of a domain before it can
+                // report an overlap/isolation failure. Teardown is required
+                // to be idempotent for this rollback path; calling it here
+                // makes a failed bind safe even for in-kernel callers that do
+                // not immediately revoke the lease.
                 (h.teardown)(pci_address_packed, self.koid.0, expected_generation);
+                return Err(error);
             }
-            return Err(DeviceLeaseError::StaleOrRevoked);
         }
+        inner.iommu_bound = true;
         Ok(())
     }
 
@@ -314,6 +341,7 @@ impl DeviceLease {
             } else {
                 DeviceLeaseState::Removed
             };
+            self.active_generation.store(0, Ordering::Release);
             let ports = core::mem::take(&mut inner.gone_ports);
             (
                 expected_generation,
@@ -324,12 +352,19 @@ impl DeviceLease {
             )
         };
 
+        // Tear down the old IOMMU domain before making its physical DMA slice
+        // available for a replacement lease. Releasing the slot first would
+        // permit immediate reuse while stale translations could still issue
+        // DMA to the old range.
         if was_bound {
             let hooks = *IOMMU_LEASE_HOOKS.lock();
             if let Some(h) = hooks {
                 (h.teardown)(pci_address_packed, self.koid.0, revoked_gen);
             }
         }
+        // The slot owner includes the old generation, so a late Resource drop
+        // cannot release a replacement lease's claim.
+        crate::dma_pool::release_dynamic_slots_for_lease(self.koid, revoked_gen);
 
         for (port, key) in ports {
             let packet = self.make_gone_packet(key, revoked_gen, new_state);
@@ -368,6 +403,7 @@ impl Drop for DeviceLease {
     fn drop(&mut self) {
         let teardown_target = {
             let mut inner = self.inner.lock();
+            self.active_generation.store(0, Ordering::Release);
             if inner.iommu_bound {
                 inner.iommu_bound = false;
                 Some((inner.pci_address_packed, inner.generation))
@@ -376,10 +412,19 @@ impl Drop for DeviceLease {
             }
         };
         if let Some((pci_address_packed, active_gen)) = teardown_target {
+            // The IOMMU teardown is synchronous. Keep the physical slice
+            // reserved until translations and page tables are gone, then
+            // permit a replacement lease to claim it.
             let hooks = *IOMMU_LEASE_HOOKS.lock();
             if let Some(h) = hooks {
                 (h.teardown)(pci_address_packed, self.koid.0, active_gen);
             }
+            crate::dma_pool::release_dynamic_slots_for_lease(self.koid, active_gen);
+        } else {
+            // A lease can have no IOMMU binding while still owning a dynamic
+            // slice during a failed handoff. Do not leak that kernel claim.
+            let generation = self.inner.lock().generation;
+            crate::dma_pool::release_dynamic_slots_for_lease(self.koid, generation);
         }
     }
 }

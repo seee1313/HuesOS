@@ -125,7 +125,7 @@ run_clippy_suite() {
             cargo clippy --release --features pci-force-legacy -- -D warnings
     )
 
-    for program in driver-host-input driver-host-nvme driver-host-xhci hxfs-service net-service wlan-service terminal doom fdisk hsh-bin huesos-std coreutils fault-probe dyn-rust-smoke acpi-manager uacpi-runtime pci-manager shutdown-broker key-broker ld-huesos ld-pe; do
+    for program in driver-host-input driver-host-nvme driver-host-xhci hxfs-service net-service wlan-service terminal doom fdisk hsh-bin huesos-std coreutils fault-probe dyn-rust-smoke acpi-manager uacpi-runtime pci-manager pci-hotplug-test shutdown-broker key-broker ld-huesos ld-pe; do
         (
             cd "crates/huesos-userspace/$program"
             cargo clippy --release -- -D warnings

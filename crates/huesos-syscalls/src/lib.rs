@@ -25,6 +25,7 @@ mod handle;
 mod job;
 mod key;
 mod observe;
+mod pci_hotplug;
 mod port_interrupt;
 mod process;
 /// Resource capability primitive syscalls
@@ -277,5 +278,8 @@ pub fn dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> Syscal
         S::SystemIommuStatus => {
             system::sys_system_iommu_status(a1 as *mut huesos_abi::pci_iommu::KernelIommuStatus)
         }
+        S::PciHotplugTrigger => pci_hotplug::sys_pci_hotplug_trigger(
+            a1 as *const huesos_abi::pci_hotplug::PciHotplugTriggerArgs,
+        ),
     }
 }

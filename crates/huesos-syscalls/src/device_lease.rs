@@ -91,6 +91,16 @@ pub(crate) fn sys_device_lease_mint_resource(
         _ => return Err(ErrorCode::InvalidArgs),
     };
 
+    if kind == ResourceKind::DmaPool
+        && (!huesos_object::dma_pool_range_owned(args.base, args.len)
+            || !huesos_object::dynamic_slot_range_owned(args.base, args.len))
+    {
+        // A lease-bound DmaPool is reserved for one complete kernel-owned
+        // live-hotplug slice. Static boot grants are unbound resources minted
+        // by init and do not enter this path.
+        return Err(ErrorCode::AccessDenied);
+    }
+
     let resource = Resource::try_create_leased(
         kind,
         args.base,
@@ -114,6 +124,12 @@ pub(crate) fn sys_device_lease_mint_resource(
     if kind == ResourceKind::DmaPool {
         if let Err(err) = lease.attach_dma_range(args.expected_generation, args.base, args.len) {
             unregister_object(resource.koid());
+            // A hardware bind failure is fail-closed for the whole lease. A
+            // future hook implementation may have installed part of a domain
+            // before reporting an error; revoke synchronously tears down any
+            // such partial state before the caller can continue using the
+            // lease. A concurrent revoke simply makes this cleanup a no-op.
+            let _ = lease.revoke(args.expected_generation, true);
             return Err(map_lease_error(err));
         }
     }
@@ -128,6 +144,13 @@ pub(crate) fn sys_device_lease_mint_resource(
         Ok(_) => Ok(0),
         Err(error) => {
             unregister_object(koid);
+            // The resource is the capability view; the lease owns the
+            // dynamic slot and may already have an IOMMU mapping. Do not let
+            // a failed handle copy-out release the slot while the generation
+            // remains active. Revoke synchronously tears down and releases it.
+            if kind == ResourceKind::DmaPool {
+                let _ = lease.revoke(args.expected_generation, true);
+            }
             Err(error)
         }
     }
@@ -248,7 +271,22 @@ pub(crate) fn sys_device_lease_attach_dma(
     let dma_res = dma_obj
         .downcast_ref::<Resource>()
         .ok_or(ErrorCode::WrongType)?;
-    if !dma_res.is_lease_active() {
+    if !dma_res.is_lease_active()
+        || !huesos_object::dma_pool_range_owned(dma_res.base(), dma_res.len())
+    {
+        return Err(ErrorCode::AccessDenied);
+    }
+    // Static boot grants are intentionally unbound and may be attached by
+    // their trusted supervisor. Dynamic hotplug DmaPool resources are already
+    // bound to the creating lease; never let a second lease attach the same
+    // physical slice, even if both callers hold a writable lease handle.
+    if let Some((bound_lease, bound_generation)) = dma_res.lease_binding() {
+        if bound_lease != lease_handle.koid || bound_generation != expected_generation {
+            return Err(ErrorCode::AccessDenied);
+        }
+    } else if huesos_object::range_overlaps_dynamic_area(dma_res.base(), dma_res.len()) {
+        // A generic root-created resource may cover only fixed boot slices;
+        // the live hotplug area requires the lease-bound slot path.
         return Err(ErrorCode::AccessDenied);
     }
     let lease_obj = huesos_object::lookup_object(lease_handle.koid).ok_or(ErrorCode::BadHandle)?;

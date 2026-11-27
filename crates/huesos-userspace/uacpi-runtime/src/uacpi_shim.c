@@ -10,6 +10,8 @@
 #include <uacpi/uacpi.h>
 #include <uacpi/utilities.h>
 
+#include "hotplug.h"
+
 static _Alignas(16) struct acpi_facs g_local_facs;
 
 /*
@@ -165,6 +167,9 @@ int hues_uacpi_initialize_namespace(
     return (int)init_st;
 }
 
+extern uacpi_status hues_uacpi_dispatch_sci(void);
+extern int hues_uacpi_install_hotplug_notify(void);
+
 uacpi_i64 hues_uacpi_namespace_phase(
     uacpi_u32 phase,
     uacpi_u32 loop_timeout_secs,
@@ -181,6 +186,12 @@ uacpi_i64 hues_uacpi_namespace_phase(
         uacpi_u64 packed =
             (((uacpi_u64)(uacpi_u32)pic_st) << 32) | (uacpi_u64)(uacpi_u32)init_st;
         return (uacpi_i64)packed;
+    }
+    if (phase == 2) {
+        return (uacpi_i64)(uacpi_i32)hues_uacpi_dispatch_sci();
+    }
+    if (phase == 3) {
+        return (uacpi_i64)(uacpi_i32)hues_uacpi_install_hotplug_notify();
     }
     return (uacpi_i64)(uacpi_i32)UACPI_STATUS_INVALID_ARGUMENT;
 }
@@ -735,6 +746,195 @@ int hues_uacpi_collect_pci_roots(HuesPciRootsOut *out)
         return (int)st;
     if (fctx.error != UACPI_STATUS_OK)
         return (int)fctx.error;
+    return (int)UACPI_STATUS_OK;
+}
+
+struct hues_hotplug_bus_ctx {
+    uacpi_u8 found;
+    uacpi_u8 start_bus;
+    uacpi_u8 end_bus;
+};
+
+static uacpi_iteration_decision hues_hotplug_bus_resource(
+    void *user, uacpi_resource *res)
+{
+    struct hues_hotplug_bus_ctx *ctx =
+        (struct hues_hotplug_bus_ctx *)user;
+    const uacpi_resource_address_common *common = UACPI_NULL;
+    uacpi_u64 minimum = 0;
+    uacpi_u64 maximum = 0;
+    uacpi_u64 translation = 0;
+    uacpi_u64 length = 0;
+
+    switch (res->type) {
+    case UACPI_RESOURCE_TYPE_ADDRESS16:
+        common = &res->address16.common;
+        minimum = res->address16.minimum;
+        maximum = res->address16.maximum;
+        translation = res->address16.translation_offset;
+        length = res->address16.address_length;
+        break;
+    case UACPI_RESOURCE_TYPE_ADDRESS32:
+        common = &res->address32.common;
+        minimum = res->address32.minimum;
+        maximum = res->address32.maximum;
+        translation = res->address32.translation_offset;
+        length = res->address32.address_length;
+        break;
+    case UACPI_RESOURCE_TYPE_ADDRESS64:
+        common = &res->address64.common;
+        minimum = res->address64.minimum;
+        maximum = res->address64.maximum;
+        translation = res->address64.translation_offset;
+        length = res->address64.address_length;
+        break;
+    case UACPI_RESOURCE_TYPE_ADDRESS64_EXTENDED:
+        common = &res->address64_extended.common;
+        minimum = res->address64_extended.minimum;
+        maximum = res->address64_extended.maximum;
+        translation = res->address64_extended.translation_offset;
+        length = res->address64_extended.address_length;
+        break;
+    default:
+        return UACPI_ITERATION_DECISION_CONTINUE;
+    }
+
+    if (common->direction != UACPI_PRODUCER || common->type != UACPI_RANGE_BUS
+        || translation != 0 || length == 0 || minimum > maximum
+        || minimum > 0xFFu || maximum > 0xFFu
+        || (maximum - minimum) != (length - 1))
+        return UACPI_ITERATION_DECISION_CONTINUE;
+
+    if (ctx->found == 0) {
+        ctx->start_bus = (uacpi_u8)minimum;
+        ctx->end_bus = (uacpi_u8)maximum;
+    }
+    if (ctx->found != 0xFFu)
+        ctx->found++;
+    return UACPI_ITERATION_DECISION_CONTINUE;
+}
+
+static int hues_hotplug_node_has_bus_range(uacpi_namespace_node *node)
+{
+    struct hues_hotplug_bus_ctx ctx = { 0, 0, 0 };
+    uacpi_status st = uacpi_for_each_device_resource(
+        node, "_CRS", hues_hotplug_bus_resource, &ctx);
+    return st == UACPI_STATUS_OK && ctx.found == 1;
+}
+
+static int hues_hotplug_is_root(uacpi_namespace_node *node)
+{
+    static const uacpi_char *const root_hids[] = {
+        "PNP0A08",
+        "PNP0A03",
+        UACPI_NULL,
+    };
+    return uacpi_device_matches_pnp_id(node, root_hids) == UACPI_TRUE;
+}
+
+/*
+ * Resolve the notification node to a canonical PCI identity before Rust sees
+ * it.  ACPI namespace nodes without _ADR are walked upwards; this handles the
+ * common slot/device wrapper layout while still rejecting a notification that
+ * is not below a validated PCI root bridge.
+ */
+int hues_uacpi_map_hotplug_node(
+    uacpi_namespace_node *node, HuesHotplugTarget *out_target)
+{
+    uacpi_namespace_node *cursor = node;
+    uacpi_namespace_node *target_node = UACPI_NULL;
+    uacpi_namespace_node *root_node = UACPI_NULL;
+    uacpi_u64 target_adr = 0;
+    uacpi_u64 segment = 0;
+    uacpi_u64 bbn = 0;
+    uacpi_status st;
+    uacpi_namespace_node_info *info = UACPI_NULL;
+
+    if (node == UACPI_NULL || out_target == UACPI_NULL)
+        return (int)UACPI_STATUS_INVALID_ARGUMENT;
+    uacpi_memzero(out_target, sizeof(*out_target));
+
+    while (cursor != UACPI_NULL && cursor != uacpi_namespace_root()) {
+        if (hues_hotplug_is_root(cursor)) {
+            root_node = cursor;
+            break;
+        }
+        st = uacpi_get_namespace_node_info(cursor, &info);
+        if (st == UACPI_STATUS_OK && info != UACPI_NULL) {
+            if (target_node == UACPI_NULL
+                && (info->flags & UACPI_NS_NODE_INFO_HAS_ADR) != 0) {
+                target_node = cursor;
+                target_adr = info->adr;
+            }
+            uacpi_free_namespace_node_info(info);
+            info = UACPI_NULL;
+        }
+        cursor = uacpi_namespace_node_parent(cursor);
+    }
+
+    if (root_node == UACPI_NULL)
+        return (int)UACPI_STATUS_NOT_FOUND;
+
+    st = uacpi_eval_simple_integer(root_node, "_SEG", &segment);
+    if (st == UACPI_STATUS_NOT_FOUND)
+        segment = 0;
+    else if (st != UACPI_STATUS_OK || segment > 0xFFFFu)
+        return (int)(st == UACPI_STATUS_OK ? UACPI_STATUS_INVALID_ARGUMENT : st);
+
+    st = uacpi_eval_simple_integer(root_node, "_BBN", &bbn);
+    if (st != UACPI_STATUS_OK || bbn > 0xFFu)
+        return (int)(st == UACPI_STATUS_OK ? UACPI_STATUS_INVALID_ARGUMENT : st);
+
+    out_target->root_segment = (uacpi_u16)segment;
+    out_target->root_start_bus = (uacpi_u8)bbn;
+    out_target->root_end_bus = (uacpi_u8)bbn;
+    {
+        struct hues_hotplug_bus_ctx bus_ctx = { 0, 0, 0 };
+        st = uacpi_for_each_device_resource(
+            root_node, "_CRS", hues_hotplug_bus_resource, &bus_ctx);
+        if (st != UACPI_STATUS_OK || bus_ctx.found != 1)
+            return (int)(st == UACPI_STATUS_OK ? UACPI_STATUS_NOT_FOUND : st);
+        if (bus_ctx.start_bus != (uacpi_u8)bbn)
+            return (int)UACPI_STATUS_INVALID_ARGUMENT;
+        out_target->root_start_bus = bus_ctx.start_bus;
+        out_target->root_end_bus = bus_ctx.end_bus;
+    }
+
+    if (target_node == UACPI_NULL) {
+        out_target->kind = HUES_HOTPLUG_TARGET_ROOT;
+    } else {
+        uacpi_u64 device = (target_adr >> 16) & 0xFFFFu;
+        uacpi_u64 function = target_adr & 0xFFFFu;
+        int target_is_bridge;
+        uacpi_u8 target_bus = out_target->root_start_bus;
+        uacpi_namespace_node *parent;
+        if (target_adr > 0xFFFFFFFFu || device > 31u || function > 7u)
+            return (int)UACPI_STATUS_INVALID_ARGUMENT;
+        target_is_bridge = hues_hotplug_node_has_bus_range(target_node);
+        /* A bridge's own BDF is on its parent's bus.  An endpoint's BDF is
+         * on the nearest ancestor bridge's secondary bus. */
+        parent = uacpi_namespace_node_parent(target_node);
+        while (parent != UACPI_NULL && parent != root_node) {
+            struct hues_hotplug_bus_ctx parent_bus = { 0, 0, 0 };
+            st = uacpi_for_each_device_resource(
+                parent, "_CRS", hues_hotplug_bus_resource, &parent_bus);
+            if (st != UACPI_STATUS_OK && st != UACPI_STATUS_NOT_FOUND)
+                return (int)st;
+            if (parent_bus.found) {
+                target_bus = parent_bus.start_bus;
+                break;
+            }
+            parent = uacpi_namespace_node_parent(parent);
+        }
+        out_target->kind = target_is_bridge
+            ? HUES_HOTPLUG_TARGET_BRIDGE
+            : HUES_HOTPLUG_TARGET_FUNCTION;
+        out_target->bus = target_bus;
+        out_target->device = (uacpi_u8)device;
+        out_target->function = (uacpi_u8)function;
+    }
+    out_target->segment = (uacpi_u16)segment;
+    out_target->valid = 1;
     return (int)UACPI_STATUS_OK;
 }
 

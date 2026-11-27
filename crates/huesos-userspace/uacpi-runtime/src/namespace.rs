@@ -13,6 +13,8 @@ pub const MAX_AML_LOOP_ITERATIONS: u32 = 10_000;
 
 const PHASE_LOAD: u32 = 0;
 const PHASE_INITIALIZE: u32 = 1;
+const PHASE_DISPATCH_SCI: u32 = 2;
+const PHASE_INSTALL_HOTPLUG_NOTIFY: u32 = 3;
 
 extern "C" {
     fn hues_uacpi_namespace_phase(phase: u32, loop_timeout_secs: u32, max_stack_depth: u32) -> i64;
@@ -71,6 +73,31 @@ fn run_shim_phase(phase: u32) -> i64 {
 /// Initialize the full uACPI runtime (`UACPI_FLAG_NO_ACPI_MODE`), install the
 /// mediated `SystemMemory` OpRegion handler, and load the DSDT/SSDT AML
 /// namespace for `snapshot_id` without executing `_STA`, `_INI`, or `_REG`.
+/// Install one root Notify handler after the real SCI/GPE event engine is
+/// initialized. uACPI invokes this handler for every device notification,
+/// including notifications produced by GPE AML methods.
+pub fn install_hotplug_notify() -> Result<(), NamespaceLoadError> {
+    let status = run_shim_phase(PHASE_INSTALL_HOTPLUG_NOTIFY) as i32;
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(NamespaceLoadError::UacpiStatus(status))
+    }
+}
+
+/// Dispatch one SCI packet that was dequeued from the kernel Port. The C shim
+/// invokes uACPI's registered `handle_sci`, drains GPE/Notify work, and only
+/// then returns to the caller so the level-triggered IRQ can be acknowledged.
+pub fn dispatch_sci() -> Result<(), NamespaceLoadError> {
+    let status = run_shim_phase(PHASE_DISPATCH_SCI) as i32;
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(NamespaceLoadError::UacpiStatus(status))
+    }
+}
+
+/// Load the namespace and retain the existing AP-13 readiness contract.
 pub fn load_namespace(snapshot_id: u64) -> Result<NamespaceLoadStatus, NamespaceLoadError> {
     if snapshot_id == 0 || !crate::broker_installed() {
         return Err(NamespaceLoadError::NotReady);
