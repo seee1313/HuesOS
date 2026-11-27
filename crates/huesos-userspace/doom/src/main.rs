@@ -104,7 +104,7 @@ pub extern "C" fn _start() -> ! {
 }
 
 extern "C" fn doom_main() -> ! {
-    libcanvas::heap::HEAP.init_process_heap();
+    ALLOCATOR.init_process_heap();
     libcanvas::println!("[doom] HuesOS DoomGeneric starting (Freedoom Phase 1 + SFX/OPL2)");
     let arg0 = c"doom".as_ptr() as *mut u8;
     let arg1 = c"-iwad".as_ptr() as *mut u8;

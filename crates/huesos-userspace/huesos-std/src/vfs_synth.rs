@@ -5,6 +5,13 @@
 //! `CapKind::{BtlService, AudioService}` channels. Standard file tools (`ls`,
 //! `cat`, `hexdump`, shell redirects) work seamlessly on both subtrees.
 
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::collapsible_if,
+    clippy::collapsible_match
+)]
+
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;

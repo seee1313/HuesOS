@@ -14,8 +14,8 @@ use huesos_abi::auxv::caps_mask;
 use huesos_abi::hxfs::rights as hxfs_rights;
 use huesos_abi::term_ipc::{hsh_to_term, put_u16, term_to_hsh, MAX_WRITE_CHUNK};
 use huesos_hsh::{
-    AudioAccess, BtlAccess, CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, NetAccess,
-    PipelineCommand, ShellHost, Table, Value, WlanAccess,
+    CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, NetAccess, PipelineCommand,
+    ShellHost, Table, Value, WlanAccess,
 };
 use libcanvas::process::{spawn_elf_from_vmo_with_caps, Process, SpawnCaps};
 use libcanvas::{wait_any, Channel, ErrorCode, Handle, Hxfs, Signals, Vmo, WaitItem};
@@ -2910,7 +2910,7 @@ impl ShellHost for HshHost {
                 args.push(String::from("-a"));
             }
             args.push(abs.clone());
-            let val = Value::Bytes(data.to_vec());
+            let val = Value::Text(String::from_utf8_lossy(data).into_owned());
             let out = self.spawn_external(None, "tee", &args, Some(&val), true, false);
             return if out.status == 0 {
                 Ok(())
@@ -2956,7 +2956,7 @@ impl ShellHost for HshHost {
         if abs.starts_with("/net/btl/") || abs.starts_with("/dev/audio/") {
             let out = self.spawn_external(None, "cat", &[abs.clone()], None, true, false);
             return if out.status == 0 {
-                Ok(out.value.render_text().into_bytes())
+                Ok(out.output.into_text().into_bytes())
             } else {
                 Err(format!("read '{abs}' failed (status={})", out.status))
             };

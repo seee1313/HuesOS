@@ -197,6 +197,7 @@ impl BotPipeState {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub struct BtHciPipeState {
     pub active: bool,
     pub is_realtek: bool,

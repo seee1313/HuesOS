@@ -1,6 +1,13 @@
 //! Capability-first Audio Subsystem (`HAUD` -> `/services/audio.elf`) and
 //! lock-free `HARB` v1 SPSC VMO playback streams for HuesOS user-space programs.
 
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::collapsible_if,
+    clippy::collapsible_match
+)]
+
 use alloc::vec::Vec;
 use spin::Mutex;
 
