@@ -420,7 +420,7 @@ fn poll_hotplug_events(
                 }
                 let event = hotplug::HotplugEvent {
                     target,
-                    kind: wire.kind.into(),
+                    kind: hotplug_event_kind(wire.kind),
                     manager_generation,
                 };
                 if !authority.writable {
@@ -454,12 +454,12 @@ fn poll_hotplug_events(
     did_work
 }
 
-impl From<pci_hotplug::HotplugNotifyKind> for hotplug::HotplugEventKind {
-    fn from(kind: pci_hotplug::HotplugNotifyKind) -> Self {
-        match kind {
-            pci_hotplug::HotplugNotifyKind::RescanSubtree => Self::RescanSubtree,
-            pci_hotplug::HotplugNotifyKind::OrderlyEject => Self::OrderlyEject,
-            pci_hotplug::HotplugNotifyKind::SurpriseLinkDown => Self::SurpriseLinkDown,
+fn hotplug_event_kind(kind: pci_hotplug::HotplugNotifyKind) -> hotplug::HotplugEventKind {
+    match kind {
+        pci_hotplug::HotplugNotifyKind::RescanSubtree => hotplug::HotplugEventKind::RescanSubtree,
+        pci_hotplug::HotplugNotifyKind::OrderlyEject => hotplug::HotplugEventKind::OrderlyEject,
+        pci_hotplug::HotplugNotifyKind::SurpriseLinkDown => {
+            hotplug::HotplugEventKind::SurpriseLinkDown
         }
     }
 }
