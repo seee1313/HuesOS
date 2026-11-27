@@ -1,14 +1,13 @@
 //! Standard Wireshark-compatible `btsnoop` Version 1 (`Datalink = 1002 = H4`)
 //! bounded ring-buffer packet capture backing `/net/btl/snoop`.
 
+use crate::hci::{H4_ACL, H4_CMD, H4_EVT};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use crate::hci::{H4_ACL, H4_CMD, H4_EVT};
 
 /// 16-byte `btsnoop` v1 file header (`"btsnoop\0"`, version `1`, datalink `1002` H4 UART).
 pub const BTSNOOP_FILE_HEADER: [u8; 16] = [
-    b'b', b't', b's', b'n', b'o', b'o', b'p', 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x03,
-    0xEA,
+    b'b', b't', b's', b'n', b'o', b'o', b'p', 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x03, 0xEA,
 ];
 
 /// Epoch delta between `0000-01-01 00:00:00` (`btsnoop` base) and `2026-01-01 00:00:00` in us.

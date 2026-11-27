@@ -110,12 +110,7 @@ impl LinearResampler {
 
 /// Apply master volume (`0..=100`, plus mute flag) and saturating soft-clamp from `i32`
 /// accumulator into interleaved `i16` stereo output.
-pub fn finalize_mix_buffer(
-    accum: &[i32],
-    master_volume_pct: u8,
-    muted: bool,
-    out: &mut [i16],
-) {
+pub fn finalize_mix_buffer(accum: &[i32], master_volume_pct: u8, muted: bool, out: &mut [i16]) {
     let n = accum.len().min(out.len());
     if muted || master_volume_pct == 0 {
         out[..n].fill(0);

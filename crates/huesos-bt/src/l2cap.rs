@@ -1,8 +1,8 @@
 //! Bluetooth Classic `L2CAP` Basic Mode (`CID 0x0001` signaling + dynamic `0x0040..0xFFFF`
 //! connection-oriented channels) for `/net/btl`.
 
-use alloc::vec::Vec;
 use crate::hci::BdAddr;
+use alloc::vec::Vec;
 
 /// Fixed L2CAP Signaling Channel ID for ACL-U links.
 pub const CID_SIGNALING: u16 = 0x0001;
@@ -254,12 +254,7 @@ impl L2capEngine {
     }
 
     /// Initiate an outbound L2CAP channel to `(conn_handle, peer_addr, psm)`, returning `local_cid`.
-    pub fn connect(
-        &mut self,
-        conn_handle: u16,
-        peer_addr: BdAddr,
-        psm: u16,
-    ) -> u16 {
+    pub fn connect(&mut self, conn_handle: u16, peer_addr: BdAddr, psm: u16) -> u16 {
         let local_cid = self.alloc_local_cid();
         let ident = self.alloc_ident();
         self.channels.push(L2capChannel {
@@ -375,11 +370,9 @@ impl L2capEngine {
         if cid == CID_CONNECTIONLESS {
             return;
         }
-        if let Some(ch) = self
-            .channels
-            .iter()
-            .find(|c| c.conn_handle == conn_handle && c.local_cid == cid && c.state == L2capChanState::Open)
-        {
+        if let Some(ch) = self.channels.iter().find(|c| {
+            c.conn_handle == conn_handle && c.local_cid == cid && c.state == L2capChanState::Open
+        }) {
             let psm = ch.psm;
             self.events.push(L2capEvent::DataReceived {
                 local_cid: cid,
@@ -554,7 +547,10 @@ impl L2capEngine {
                     if let Some(ch) = self.channels.iter_mut().find(|c| {
                         c.conn_handle == conn_handle
                             && c.local_cid == dst_cid
-                            && matches!(c.state, L2capChanState::Config { .. } | L2capChanState::Open)
+                            && matches!(
+                                c.state,
+                                L2capChanState::Config { .. } | L2capChanState::Open
+                            )
                     }) {
                         if let Some(m) = parsed_mtu {
                             ch.remote_mtu = m.max(48);
@@ -587,9 +583,11 @@ impl L2capEngine {
                 SIG_CONFIG_RSP if data.len() >= 6 => {
                     let src_cid = u16::from_le_bytes([data[0], data[1]]);
                     let result = u16::from_le_bytes([data[4], data[5]]);
-                    if let Some(ch) = self.channels.iter_mut().find(|c| {
-                        c.conn_handle == conn_handle && c.local_cid == src_cid
-                    }) {
+                    if let Some(ch) = self
+                        .channels
+                        .iter_mut()
+                        .find(|c| c.conn_handle == conn_handle && c.local_cid == src_cid)
+                    {
                         if result == 0x0000 {
                             if let L2capChanState::Config {
                                 ref mut local_cfg_done,
@@ -629,9 +627,11 @@ impl L2capEngine {
                         conn_handle,
                         pdu: wrap_sig_cmd(SIG_DISCONN_RSP, ident, &rsp),
                     });
-                    if let Some(ch) = self.channels.iter_mut().find(|c| {
-                        c.conn_handle == conn_handle && c.local_cid == dst_cid
-                    }) {
+                    if let Some(ch) = self
+                        .channels
+                        .iter_mut()
+                        .find(|c| c.conn_handle == conn_handle && c.local_cid == dst_cid)
+                    {
                         let psm = ch.psm;
                         ch.state = L2capChanState::Closed;
                         self.events.push(L2capEvent::ChannelClosed {
@@ -642,9 +642,11 @@ impl L2capEngine {
                 }
                 SIG_DISCONN_RSP if data.len() >= 4 => {
                     let src_cid = u16::from_le_bytes([data[2], data[3]]);
-                    if let Some(ch) = self.channels.iter_mut().find(|c| {
-                        c.conn_handle == conn_handle && c.local_cid == src_cid
-                    }) {
+                    if let Some(ch) = self
+                        .channels
+                        .iter_mut()
+                        .find(|c| c.conn_handle == conn_handle && c.local_cid == src_cid)
+                    {
                         let psm = ch.psm;
                         ch.state = L2capChanState::Closed;
                         self.events.push(L2capEvent::ChannelClosed {

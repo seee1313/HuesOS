@@ -636,9 +636,12 @@ impl DriverRuntime {
                                 if let Some((sid, _, _, _)) = ctrl.first_bt_hci_info() {
                                     let irq_ref = &self.irq;
                                     if ctrl
-                                        .execute_bt_hci_cmd(sid, &req[8..n], &mut self.input, || {
-                                            irq_ref.wait_brief(1)
-                                        })
+                                        .execute_bt_hci_cmd(
+                                            sid,
+                                            &req[8..n],
+                                            &mut self.input,
+                                            || irq_ref.wait_brief(1),
+                                        )
                                         .is_ok()
                                     {
                                         0
@@ -665,9 +668,12 @@ impl DriverRuntime {
                                 if let Some((sid, _, _, _)) = ctrl.first_bt_hci_info() {
                                     let irq_ref = &self.irq;
                                     if ctrl
-                                        .execute_bt_hci_acl(sid, &req[8..n], &mut self.input, || {
-                                            irq_ref.wait_brief(1)
-                                        })
+                                        .execute_bt_hci_acl(
+                                            sid,
+                                            &req[8..n],
+                                            &mut self.input,
+                                            || irq_ref.wait_brief(1),
+                                        )
                                         .is_ok()
                                     {
                                         0

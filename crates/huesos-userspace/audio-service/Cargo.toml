@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "audio-service"
+name = "huesos-audio-service"
 path = "src/main.rs"
 
 [features]

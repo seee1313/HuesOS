@@ -328,11 +328,7 @@ fn write_frame_span<B: RingBacking>(store: &mut B, slot_offset: usize, samples: 
     true
 }
 
-fn read_frame_span<B: RingBacking>(
-    store: &B,
-    slot_offset: usize,
-    out_samples: &mut [i16],
-) -> bool {
+fn read_frame_span<B: RingBacking>(store: &B, slot_offset: usize, out_samples: &mut [i16]) -> bool {
     const CHUNK_SAMPLES: usize = 512;
     let mut byte_off = (HARB_HEADER_BYTES + slot_offset * BYTES_PER_STEREO_FRAME) as u64;
     let mut idx = 0usize;

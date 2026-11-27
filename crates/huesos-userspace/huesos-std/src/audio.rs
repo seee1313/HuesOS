@@ -4,9 +4,7 @@
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use huesos_abi::audio::{
-    self, AudioOp, AudioRouteMode, AudioStatus, AudioStatusSnapshot,
-};
+use huesos_abi::audio::{self, AudioOp, AudioRouteMode, AudioStatus, AudioStatusSnapshot};
 use huesos_abi::auxv::caps_mask;
 use huesos_audio::ring::{
     load_header, ring_push_stereo_i16, RingBacking, HARB_FLAG_EOS, HARB_FMT_S16LE,
@@ -410,8 +408,7 @@ pub fn play_test_tone(freq_hz: u16, duration_ms: u16) -> Result<()> {
         let n = ch
             .read_into_timeout(&mut rep, 1000)
             .map_err(Error::from_code)?;
-        let st =
-            audio::check_header(&rep[..n], AudioOp::PlayTestTone).map_err(map_audio_status)?;
+        let st = audio::check_header(&rep[..n], AudioOp::PlayTestTone).map_err(map_audio_status)?;
         if st == AudioStatus::Ok {
             Ok(())
         } else {
@@ -473,7 +470,10 @@ pub fn parse_wav(bytes: &[u8]) -> Option<WavHeader> {
             ]);
             bits_per_sample =
                 u16::from_le_bytes([bytes[payload_off + 14], bytes[payload_off + 15]]);
-            if audio_fmt != 1 || !(1..=2).contains(&ch) || (bits_per_sample != 8 && bits_per_sample != 16) {
+            if audio_fmt != 1
+                || !(1..=2).contains(&ch)
+                || (bits_per_sample != 8 && bits_per_sample != 16)
+            {
                 return None;
             }
             channels = ch as u8;

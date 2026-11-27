@@ -29,7 +29,7 @@ fn fast_sin_q15(phase: u16) -> i16 {
     let quad = phase >> 14;
     let x = i32::from(phase & 0x3FFF); // 0..16383
     let u = if (quad & 1) != 0 { 16384 - x } else { x }; // 0..16384
-    // Bhaskara/parabolic fit: sin(pi/2 * u/16384) ~= u * (32768 - u) / 8192
+                                                         // Bhaskara/parabolic fit: sin(pi/2 * u/16384) ~= u * (32768 - u) / 8192
     let y = ((u * (32768 - u)) >> 13).min(32767);
     if (quad & 2) != 0 {
         -(y as i16)

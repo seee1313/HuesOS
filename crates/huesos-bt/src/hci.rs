@@ -823,9 +823,7 @@ pub fn decode_event(pkt: &[u8]) -> Option<DecodedHciEvent<'_>> {
         EVT_LINK_KEY_REQ if p.len() >= 6 => {
             let mut addr = [0u8; 6];
             addr.copy_from_slice(&p[0..6]);
-            Some(DecodedHciEvent::LinkKeyRequest {
-                addr: BdAddr(addr),
-            })
+            Some(DecodedHciEvent::LinkKeyRequest { addr: BdAddr(addr) })
         }
         EVT_LINK_KEY_NOTIFY if p.len() >= 23 => {
             let mut addr = [0u8; 6];
@@ -843,16 +841,12 @@ pub fn decode_event(pkt: &[u8]) -> Option<DecodedHciEvent<'_>> {
         EVT_PIN_CODE_REQ if p.len() >= 6 => {
             let mut addr = [0u8; 6];
             addr.copy_from_slice(&p[0..6]);
-            Some(DecodedHciEvent::PinCodeRequest {
-                addr: BdAddr(addr),
-            })
+            Some(DecodedHciEvent::PinCodeRequest { addr: BdAddr(addr) })
         }
         EVT_IO_CAP_REQ if p.len() >= 6 => {
             let mut addr = [0u8; 6];
             addr.copy_from_slice(&p[0..6]);
-            Some(DecodedHciEvent::IoCapabilityRequest {
-                addr: BdAddr(addr),
-            })
+            Some(DecodedHciEvent::IoCapabilityRequest { addr: BdAddr(addr) })
         }
         EVT_USER_CONFIRM_REQ if p.len() >= 10 => {
             let mut addr = [0u8; 6];
@@ -985,11 +979,7 @@ impl AclCreditTracker {
 
 /// Segment an L2CAP frame (`[len_lo, len_hi, cid_lo, cid_hi, payload...]`) into HCI ACL packets
 /// (`[handle_pb_lo, handle_pb_hi, acl_len_lo, acl_len_hi, chunk...]`) of at most `max_acl_len`.
-pub fn segment_l2cap_to_acl(
-    conn_handle: u16,
-    l2cap_pdu: &[u8],
-    max_acl_len: u16,
-) -> Vec<Vec<u8>> {
+pub fn segment_l2cap_to_acl(conn_handle: u16, l2cap_pdu: &[u8], max_acl_len: u16) -> Vec<Vec<u8>> {
     let chunk_cap = usize::from(max_acl_len.max(27));
     let mut out = Vec::new();
     if l2cap_pdu.is_empty() {

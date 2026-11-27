@@ -39,9 +39,8 @@ use huesos_bt::hci::{
     cmd_write_default_link_policy, cmd_write_inquiry_mode, cmd_write_local_name,
     cmd_write_page_timeout, cmd_write_scan_enable, cmd_write_simple_pairing_mode, decode_event,
     parse_buffer_size_return, parse_local_version_return, segment_l2cap_to_acl, AclCreditTracker,
-    AclReassembler, BdAddr, DecodedHciEvent, DiscoveredPeer, LinkKey, H4_ACL,
-    H4_CMD, H4_EVT, LOCAL_COD_COMPUTER_AUDIO_SOURCE, OP_READ_BD_ADDR, OP_READ_BUFFER_SIZE,
-    OP_READ_LOCAL_VERSION,
+    AclReassembler, BdAddr, DecodedHciEvent, DiscoveredPeer, LinkKey, H4_ACL, H4_CMD, H4_EVT,
+    LOCAL_COD_COMPUTER_AUDIO_SOURCE, OP_READ_BD_ADDR, OP_READ_BUFFER_SIZE, OP_READ_LOCAL_VERSION,
 };
 use huesos_bt::l2cap::{L2capEngine, L2capEvent, PSM_AVCTP, PSM_AVDTP, PSM_SDP};
 use huesos_bt::sdp::{
@@ -80,16 +79,14 @@ const MAX_ACCEPT_QUEUE_PER_PSM: usize = 8;
 // ============================================================================
 
 const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-    0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-    0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-    0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-    0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-    0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-    0xc67178f2,
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
 fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
@@ -401,7 +398,7 @@ fn build_sdp_uuid_query(tid: u16, uuid16: u16) -> Vec<u8> {
     out.push(SDP_SVC_SEARCH_ATTR_REQ);
     out.extend_from_slice(&tid.to_be_bytes());
     out.extend_from_slice(&12u16.to_be_bytes()); // param len = 12
-    // ServiceSearchPattern: Sequence(len=3) { UUID16(uuid16) }
+                                                 // ServiceSearchPattern: Sequence(len=3) { UUID16(uuid16) }
     out.push(0x35);
     out.push(0x03);
     out.push(0x19);
@@ -606,7 +603,8 @@ impl BtlRuntime {
         let hxfs = Hxfs::from_channel(ch);
         if let Some(disk_keys) = load_keys_from_hxfs(&hxfs) {
             for dk in disk_keys {
-                if !self.keys.iter().any(|k| k.addr == dk.addr) && self.keys.len() < MAX_KEY_SUMMARIES
+                if !self.keys.iter().any(|k| k.addr == dk.addr)
+                    && self.keys.len() < MAX_KEY_SUMMARIES
                 {
                     self.keys.push(dk);
                 }
@@ -765,13 +763,19 @@ impl BtlRuntime {
             match self.transport {
                 BtlTransportKind::Absent => break,
                 BtlTransportKind::VirtualLoopback => {
-                    let next_evt = self.virtual_bt.as_mut().and_then(VirtualBtMedium::pop_hci_event);
+                    let next_evt = self
+                        .virtual_bt
+                        .as_mut()
+                        .and_then(VirtualBtMedium::pop_hci_event);
                     if let Some(evt) = next_evt {
                         progressed = true;
                         self.on_hci_event(&evt);
                         continue;
                     }
-                    let next_acl = self.virtual_bt.as_mut().and_then(VirtualBtMedium::pop_hci_acl);
+                    let next_acl = self
+                        .virtual_bt
+                        .as_mut()
+                        .and_then(VirtualBtMedium::pop_hci_acl);
                     if let Some(acl) = next_acl {
                         progressed = true;
                         self.on_hci_acl(&acl);
@@ -1047,10 +1051,8 @@ impl BtlRuntime {
                     ..
                 } => {
                     if initiator {
-                        if let Some(ep) = self
-                            .endpoints
-                            .iter_mut()
-                            .find(|e| e.local_cid == local_cid)
+                        if let Some(ep) =
+                            self.endpoints.iter_mut().find(|e| e.local_cid == local_cid)
                         {
                             ep.open = true;
                             ep.remote_mtu = remote_mtu;
@@ -1089,10 +1091,8 @@ impl BtlRuntime {
                         if let Some(rsp) = handle_sdp_request(&payload) {
                             let _ = self.l2cap.send_data(local_cid, &rsp);
                         }
-                    } else if let Some(ep) = self
-                        .endpoints
-                        .iter_mut()
-                        .find(|e| e.local_cid == local_cid)
+                    } else if let Some(ep) =
+                        self.endpoints.iter_mut().find(|e| e.local_cid == local_cid)
                     {
                         if ep.rx_queue.len() < MAX_RX_QUEUE_PER_CID {
                             ep.rx_queue.push_back(payload);
@@ -1100,11 +1100,7 @@ impl BtlRuntime {
                     }
                 }
                 L2capEvent::ChannelClosed { local_cid, .. } => {
-                    if let Some(ep) = self
-                        .endpoints
-                        .iter_mut()
-                        .find(|e| e.local_cid == local_cid)
-                    {
+                    if let Some(ep) = self.endpoints.iter_mut().find(|e| e.local_cid == local_cid) {
                         ep.open = false;
                     }
                 }
@@ -1338,10 +1334,7 @@ impl BtlRuntime {
                     let rn_deadline = monotonic_ms().saturating_add(400);
                     for _budget in 0..128u32 {
                         self.pump_transport(8);
-                        if self
-                            .peers
-                            .iter()
-                            .any(|p| p.addr == addr && p.name_len > 0)
+                        if self.peers.iter().any(|p| p.addr == addr && p.name_len > 0)
                             || monotonic_ms() >= rn_deadline
                         {
                             break;
@@ -1917,8 +1910,8 @@ impl BtlRuntime {
                     return 8;
                 }
 
-                let needed_frags = ((4 + sdu.len()).div_ceil(usize::from(self.credits.max_acl_len)))
-                    .max(1) as u16;
+                let needed_frags =
+                    ((4 + sdu.len()).div_ceil(usize::from(self.credits.max_acl_len))).max(1) as u16;
                 if self.credits.available_credits() < needed_frags {
                     self.pump_transport(16);
                 }

@@ -279,7 +279,10 @@ pub extern "C" fn hues_audio_start_sfx(lumpnum: i32, channel: i32, vol: i32, sep
 #[unsafe(no_mangle)]
 pub extern "C" fn hues_audio_update_sfx(channel: i32, vol: i32, sep: i32) {
     if channel >= 0 {
-        SOUND.lock().sfx_mixer.update_channel(channel as usize, vol, sep);
+        SOUND
+            .lock()
+            .sfx_mixer
+            .update_channel(channel as usize, vol, sep);
     }
 }
 

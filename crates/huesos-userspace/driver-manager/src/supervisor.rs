@@ -1658,8 +1658,7 @@ impl DriverManager {
         if self.snd_audio_bridged {
             return;
         }
-        let (Some(snd), Some(audio)) = (self.snd_host.as_ref(), self.audio_service.as_ref())
-        else {
+        let (Some(snd), Some(audio)) = (self.snd_host.as_ref(), self.audio_service.as_ref()) else {
             return;
         };
         let Ok((snd_end, audio_end)) = Channel::pair() else {

@@ -5,7 +5,9 @@
 //! Runs inside `audio-service` over `/net/btl` L2CAP channels so `btl-service`
 //! stays a pure L2CAP/SDP/HCI transport.
 
-use crate::sbc::{SbcAllocMethod, SbcBlocks, SbcChannelMode, SbcConfig, SbcSampleRate, SbcSubbands};
+use crate::sbc::{
+    SbcAllocMethod, SbcBlocks, SbcChannelMode, SbcConfig, SbcSampleRate, SbcSubbands,
+};
 
 pub const PSM_AVDTP: u16 = 0x0019;
 pub const PSM_AVCTP: u16 = 0x0017;
@@ -172,7 +174,9 @@ impl AvdtpSourceSession {
             AVDTP_MSG_RESPONSE_ACCEPT => self.handle_response_accept(sig_id, body),
             AVDTP_MSG_RESPONSE_REJECT | AVDTP_MSG_GENERAL_REJECT => {
                 // Fall back from GET_ALL_CAPABILITIES (`0x0C`) to legacy GET_CAPABILITIES (`0x02`).
-                if sig_id == AVDTP_GET_ALL_CAPABILITIES && self.state == AvdtpState::GettingCapabilities {
+                if sig_id == AVDTP_GET_ALL_CAPABILITIES
+                    && self.state == AvdtpState::GettingCapabilities
+                {
                     let arg = [self.acp_seid << 2];
                     return self.make_cmd(AVDTP_GET_CAPABILITIES, &arg);
                 }
@@ -442,7 +446,12 @@ pub const fn encode_sbc_codec_ie(cfg: SbcConfig) -> [u8; 4] {
         SbcAllocMethod::Snr => 0x02,
         SbcAllocMethod::Loudness => 0x01,
     };
-    [freq_bit | mode_bit, blk_bit | sb_bit | alloc_bit, 2, cfg.bitpool]
+    [
+        freq_bit | mode_bit,
+        blk_bit | sb_bit | alloc_bit,
+        2,
+        cfg.bitpool,
+    ]
 }
 
 // ============================================================================
@@ -716,7 +725,10 @@ mod tests {
         assert_eq!(b5[1], AVDTP_START);
 
         let act6 = src.on_signaling_pdu(&[(b5[0] & 0xF0) | 0x02, AVDTP_START]);
-        assert_eq!(act6, AvdtpAction::StreamReady(SbcConfig::HQ_48K_JOINT_STEREO));
+        assert_eq!(
+            act6,
+            AvdtpAction::StreamReady(SbcConfig::HQ_48K_JOINT_STEREO)
+        );
         assert_eq!(src.state(), AvdtpState::Streaming);
     }
 

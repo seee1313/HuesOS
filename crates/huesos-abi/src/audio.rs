@@ -97,16 +97,16 @@ impl AudioOp {
     pub const fn requires_admin(self) -> bool {
         matches!(
             self,
-            Self::SetVolume
-                | Self::SetRouteMode
-                | Self::ConnectBtlSink
-                | Self::DisconnectBtlSink
+            Self::SetVolume | Self::SetRouteMode | Self::ConnectBtlSink | Self::DisconnectBtlSink
         )
     }
 
     /// True when `caps_mask::AUDIO_RW` (`audio=rw` or `audio=admin`) is required.
     pub const fn requires_rw(self) -> bool {
-        matches!(self, Self::OpenStream | Self::CloseStream | Self::PlayTestTone)
+        matches!(
+            self,
+            Self::OpenStream | Self::CloseStream | Self::PlayTestTone
+        )
     }
 }
 
@@ -383,7 +383,10 @@ mod tests {
         };
         snap.btl_peer_name[..18].copy_from_slice(b"HuesOS AirBuds Pro");
         let mut buf = [0u8; AudioStatusSnapshot::REPLY_LEN];
-        assert_eq!(snap.encode_reply(&mut buf), Some(AudioStatusSnapshot::REPLY_LEN));
+        assert_eq!(
+            snap.encode_reply(&mut buf),
+            Some(AudioStatusSnapshot::REPLY_LEN)
+        );
         assert_eq!(AudioStatusSnapshot::decode_reply(&buf), Ok(snap));
     }
 }

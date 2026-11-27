@@ -23,7 +23,7 @@ use huesos_abi::vmar_flags;
 use huesos_audio::ring::{ring_pop_stereo_i16, RingBacking};
 use huesos_audio::virtio_snd::{
     decode_status_code, encode_pcm_set_params, encode_pcm_simple_cmd, encode_query_pcm_info,
-     VirtioSndConfig, VirtioSndPcmInfo, PCM_INFO_ENTRY_BYTES, PCM_STATUS_BYTES, PCM_XFER_HDR_BYTES,
+    VirtioSndConfig, VirtioSndPcmInfo, PCM_INFO_ENTRY_BYTES, PCM_STATUS_BYTES, PCM_XFER_HDR_BYTES,
     VIRTIO_SND_PCM_FMT_S16, VIRTIO_SND_R_PCM_PREPARE, VIRTIO_SND_R_PCM_START,
     VIRTIO_SND_R_PCM_STOP, VIRTIO_SND_S_OK, VIRTIO_SND_VQ_CONTROL, VIRTIO_SND_VQ_EVENT,
     VIRTIO_SND_VQ_RX, VIRTIO_SND_VQ_TX,
@@ -529,7 +529,8 @@ impl VirtioSndHw {
         let mut chosen_rate = (7u8, 48_000u32);
         for idx in 0..(streams_total as usize) {
             let base = 4 + idx * PCM_INFO_ENTRY_BYTES;
-            if let Some(info) = VirtioSndPcmInfo::decode(&resp_buf[base..base + PCM_INFO_ENTRY_BYTES])
+            if let Some(info) =
+                VirtioSndPcmInfo::decode(&resp_buf[base..base + PCM_INFO_ENTRY_BYTES])
             {
                 if info.supports_stereo_s16_output() {
                     if let Some(r) = info.preferred_rate() {
@@ -594,9 +595,8 @@ impl VirtioSndHw {
         fence(Ordering::SeqCst);
         let used_idx = self.dma.read16(self.txq.used_off + 2);
         while self.txq.last_used_idx != used_idx {
-            let elem_off = self.txq.used_off
-                + 4
-                + usize::from(self.txq.last_used_idx % self.txq.q_size) * 8;
+            let elem_off =
+                self.txq.used_off + 4 + usize::from(self.txq.last_used_idx % self.txq.q_size) * 8;
             let head_desc = self.dma.read32(elem_off) as usize;
             let slot = head_desc / 2;
             if slot < TX_RING_SLOTS && self.tx_slot_busy[slot] {

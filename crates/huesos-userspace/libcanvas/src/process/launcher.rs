@@ -1046,10 +1046,7 @@ fn map_dynamic_initial_stack(
             AT_HUESOS_WLAN_SERVICE,
             u64::from(caps.wlan_service.is_some()),
         ),
-        (
-            AT_HUESOS_BTL_SERVICE,
-            u64::from(caps.btl_service.is_some()),
-        ),
+        (AT_HUESOS_BTL_SERVICE, u64::from(caps.btl_service.is_some())),
         (
             AT_HUESOS_AUDIO_SERVICE,
             u64::from(caps.audio_service.is_some()),

@@ -20,7 +20,6 @@ pub mod virtio_snd;
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
     use crate::mixer::{finalize_mix_buffer, generate_stereo_tone, parse_wav_pcm, LinearResampler};
     use crate::ring::{
         init_ring, ring_pop_clock_synced, ring_pop_stereo_i16, ring_push_stereo_i16,
@@ -31,6 +30,7 @@ mod tests {
         VirtioSndPcmInfo, VIRTIO_SND_D_OUTPUT, VIRTIO_SND_PCM_FMT_S16, VIRTIO_SND_PCM_RATE_48000,
         VIRTIO_SND_R_PCM_START, VIRTIO_SND_S_OK,
     };
+    use alloc::vec;
 
     #[test]
     fn harb_ring_wraparound_and_clock_drift_recovery() {
@@ -108,7 +108,10 @@ mod tests {
         assert_eq!(sp[20], 2);
         let st = encode_pcm_simple_cmd(VIRTIO_SND_R_PCM_START, 0);
         assert_eq!(st.len(), 8);
-        assert_eq!(decode_status_code(&VIRTIO_SND_S_OK.to_le_bytes()), Some(VIRTIO_SND_S_OK));
+        assert_eq!(
+            decode_status_code(&VIRTIO_SND_S_OK.to_le_bytes()),
+            Some(VIRTIO_SND_S_OK)
+        );
 
         let mut info_raw = [0u8; 32];
         info_raw[8..16].copy_from_slice(&(1u64 << VIRTIO_SND_PCM_FMT_S16).to_le_bytes());
@@ -120,7 +123,10 @@ mod tests {
         assert!(info.is_some());
         if let Some(i) = info {
             assert!(i.supports_stereo_s16_output());
-            assert_eq!(i.preferred_rate(), Some((VIRTIO_SND_PCM_RATE_48000, 48_000)));
+            assert_eq!(
+                i.preferred_rate(),
+                Some((VIRTIO_SND_PCM_RATE_48000, 48_000))
+            );
         }
     }
 }

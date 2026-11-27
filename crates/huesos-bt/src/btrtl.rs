@@ -4,8 +4,8 @@
 //! Follows the hardware contract of Realtek `EPATCH` (`"Realtech"` header +
 //! tail `0x51 0x04 0xFD 0x77` project-ID TLV + `0x8723AB55` config blob).
 
-use alloc::vec::Vec;
 use crate::hci::encode_cmd;
+use alloc::vec::Vec;
 
 /// Realtek USB Vendor ID.
 pub const REALTEK_USB_VID: u16 = 0x0BDA;
@@ -29,9 +29,7 @@ const EXTENSION_SIGNATURE: [u8; 4] = [0x51, 0x04, 0xFD, 0x77];
 const CONFIG_MAGIC: u32 = 0x8723_AB55;
 
 /// Known USB `PID`s for Realtek `RTL8821CE` M.2 combo Bluetooth interfaces.
-pub const RTL8821CE_USB_PIDS: &[u16] = &[
-    0xC821, 0xB00A, 0xB00C, 0xC820, 0xC822, 0xC81D, 0x8821,
-];
+pub const RTL8821CE_USB_PIDS: &[u16] = &[0xC821, 0xB00A, 0xB00C, 0xC820, 0xC822, 0xC81D, 0x8821];
 
 /// Returns `true` if `(vid, pid)` is a known Realtek `RTL8821CE` USB Bluetooth controller.
 pub fn is_rtl8821ce_usb_id(vid: u16, pid: u16) -> bool {

@@ -115,7 +115,11 @@ impl VirtualBtMedium {
         match opcode {
             OP_READ_LOCAL_VERSION => {
                 // HCI 5.1 (0x0A), rev 0x000C, LMP 5.1, Manufacturer 0x005D, subver 0x826C
-                self.push_cmd_complete(opcode, 0, &[0x0A, 0x0C, 0x00, 0x0A, 0x5D, 0x00, 0x6C, 0x82]);
+                self.push_cmd_complete(
+                    opcode,
+                    0,
+                    &[0x0A, 0x0C, 0x00, 0x0A, 0x5D, 0x00, 0x6C, 0x82],
+                );
             }
             OP_READ_BD_ADDR => {
                 self.push_cmd_complete(opcode, 0, &VIRTUAL_LOCAL_ADDR.0);
@@ -309,9 +313,7 @@ impl VirtualBtMedium {
         let events = self.peer_l2cap.drain_events();
         for ev in events {
             match ev {
-                L2capEvent::ChannelOpened {
-                    local_cid, psm, ..
-                } => match psm {
+                L2capEvent::ChannelOpened { local_cid, psm, .. } => match psm {
                     PSM_AVDTP => {
                         if self.avdtp_sig_cid.is_none() {
                             self.avdtp_sig_cid = Some(local_cid);
@@ -346,7 +348,16 @@ impl VirtualBtMedium {
                             let tid = [payload[1], payload[2]];
                             // Minimal valid SDP SearchAttributeResponse advertising `0x110B` + `0x0019`
                             let attr_seq: &[u8] = &[
-                                0x35, 0x0C, 0x35, 0x0A, 0x09, 0x00, 0x01, 0x35, 0x03, 0x19,
+                                0x35,
+                                0x0C,
+                                0x35,
+                                0x0A,
+                                0x09,
+                                0x00,
+                                0x01,
+                                0x35,
+                                0x03,
+                                0x19,
                                 (UUID_AUDIO_SINK >> 8) as u8,
                                 (UUID_AUDIO_SINK & 0xFF) as u8,
                                 0x19,
@@ -406,18 +417,7 @@ impl VirtualBtMedium {
                 //   freq=44.1|48kHz + all modes = 0x3F, blocks=4..16 + subbands=4|8 + alloc=SNR|Loudness = 0xFF,
                 //   min_bitpool=2, max_bitpool=53)
                 let rsp = [
-                    accept_hdr,
-                    sig_id,
-                    0x01,
-                    0x00,
-                    0x07,
-                    0x06,
-                    0x00,
-                    0x00,
-                    0x3F,
-                    0xFF,
-                    2,
-                    53,
+                    accept_hdr, sig_id, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x3F, 0xFF, 2, 53,
                 ];
                 let _ = self.peer_l2cap.send_data(sig_cid, &rsp);
             }
@@ -449,8 +449,7 @@ impl VirtualBtMedium {
         let num_frames = usize::from(pkt[12] & 0x0F);
         if pkt[13] == 0x9C && num_frames >= 1 {
             self.received_sbc_packets = self.received_sbc_packets.saturating_add(1);
-            self.received_sbc_frames =
-                self.received_sbc_frames.saturating_add(num_frames as u64);
+            self.received_sbc_frames = self.received_sbc_frames.saturating_add(num_frames as u64);
 
             // Once real SBC audio arrives, simulate pressing `Volume Up` (`0x41`) on the earbuds!
             if !self.sent_avrcp_vol_up {
@@ -459,7 +458,8 @@ impl VirtualBtMedium {
                     // AVCTP header (tx=1, C/R=0 cmd, PID=0x110E) + AVRCP Pass Through Press `0x41` (Vol Up)
                     let avrcp_press = [
                         0x10, 0x11, 0x0E, // AVCTP Command, PID = 0x110E (A/V Remote Control)
-                        0x00, 0x48, 0x7C, // ctype=Control(0), subunit=Panel(9<<3), opcode=PassThrough(0x7C)
+                        0x00, 0x48,
+                        0x7C, // ctype=Control(0), subunit=Panel(9<<3), opcode=PassThrough(0x7C)
                         0x41, 0x00, // op_id = 0x41 (Volume Up pressed), data_len = 0
                     ];
                     let _ = self.peer_l2cap.send_data(avctp_cid, &avrcp_press);

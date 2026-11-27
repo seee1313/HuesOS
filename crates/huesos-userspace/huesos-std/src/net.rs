@@ -6,9 +6,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use huesos_abi::auxv::caps_mask;
-use huesos_abi::btl::{
-    self, BtlKeySummary, BtlOp, BtlPeerInfo, BtlStatus, BtlStatusSnapshot,
-};
+use huesos_abi::btl::{self, BtlKeySummary, BtlOp, BtlPeerInfo, BtlStatus, BtlStatusSnapshot};
 use huesos_abi::net::{
     self, decode_dns_reply, decode_ping_reply, encode_dns_request, encode_ping_request,
     encode_simple_request, NetOp, NetStatus, NetStatusSnapshot, PingResult,

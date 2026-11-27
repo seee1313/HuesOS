@@ -189,8 +189,7 @@ impl ScudoHeap {
     /// in the address space can own [`HeapWindow`], while [`HeapLock`] serialises
     /// concurrent callers.
     pub fn init_process_heap(&'static self) -> bool {
-        static CLAIMED: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
+        static CLAIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
         if self.is_initialised() {
             return true;
         }

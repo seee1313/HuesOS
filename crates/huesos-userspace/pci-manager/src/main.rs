@@ -4359,8 +4359,7 @@ fn run_driver_binding_and_handoff(
                             meta[12..16].copy_from_slice(&common.length.to_le_bytes());
                             meta[16..20].copy_from_slice(&notify.offset.to_le_bytes());
                             meta[20..24].copy_from_slice(&notify.length.to_le_bytes());
-                            meta[24..28]
-                                .copy_from_slice(&notify.notify_multiplier.to_le_bytes());
+                            meta[24..28].copy_from_slice(&notify.notify_multiplier.to_le_bytes());
                             meta[28..32].copy_from_slice(&isr.offset.to_le_bytes());
                             meta[32..36].copy_from_slice(&isr.length.to_le_bytes());
                             meta[36..40].copy_from_slice(&dev_cfg.offset.to_le_bytes());

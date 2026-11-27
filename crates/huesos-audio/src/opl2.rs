@@ -439,8 +439,11 @@ impl Opl2Synth {
         self.ch_bend_cents[idx] = cents.clamp(-200, 200);
         for v in &mut self.voices {
             if v.active && v.midi_ch == (ch & 0x0F) {
-                v.phase_inc =
-                    midi_note_phase_inc_q32(v.base_note, i32::from(self.ch_bend_cents[idx]), self.sample_rate);
+                v.phase_inc = midi_note_phase_inc_q32(
+                    v.base_note,
+                    i32::from(self.ch_bend_cents[idx]),
+                    self.sample_rate,
+                );
             }
         }
     }
@@ -456,7 +459,14 @@ impl Opl2Synth {
         }
     }
 
-    pub fn note_on(&mut self, bank: &GenMidiBank, ch: u8, note: u8, velocity: u8, is_percussion: bool) {
+    pub fn note_on(
+        &mut self,
+        bank: &GenMidiBank,
+        ch: u8,
+        note: u8,
+        velocity: u8,
+        is_percussion: bool,
+    ) {
         let vel = velocity & 0x7F;
         if vel == 0 {
             self.note_off(ch, note);
@@ -473,7 +483,15 @@ impl Opl2Synth {
         };
 
         let patch = &bank.patches[patch_idx];
-        self.spawn_one_voice(patch, &patch.voice0, ch & 0x0F, note & 0x7F, vel, 0, is_percussion);
+        self.spawn_one_voice(
+            patch,
+            &patch.voice0,
+            ch & 0x0F,
+            note & 0x7F,
+            vel,
+            0,
+            is_percussion,
+        );
         if (patch.flags & 0x0004) != 0 {
             let detune_cents = (i16::from(patch.fine_tune) - 128) / 2;
             self.spawn_one_voice(
@@ -741,12 +759,9 @@ impl DoomMusicPlayer {
         }
 
         if song_bytes.len() >= 14 && &song_bytes[0..4] == MIDI_MTHD_MAGIC {
-            let hdr_len = u32::from_be_bytes([
-                song_bytes[4],
-                song_bytes[5],
-                song_bytes[6],
-                song_bytes[7],
-            ]) as usize;
+            let hdr_len =
+                u32::from_be_bytes([song_bytes[4], song_bytes[5], song_bytes[6], song_bytes[7]])
+                    as usize;
             let ntrks = usize::from(u16::from_be_bytes([song_bytes[10], song_bytes[11]]));
             let division = u16::from_be_bytes([song_bytes[12], song_bytes[13]]).max(1);
             let mut pos = 8 + hdr_len;
@@ -1218,8 +1233,8 @@ impl DoomSfxMixer {
         sep_0_255: i32,
     ) {
         let ch = channel % DOOM_SFX_CHANNELS;
-        let step_q16 = ((u64::from(in_rate.max(4000)) << 16) / u64::from(self.out_rate.max(8000)))
-            .max(1024);
+        let step_q16 =
+            ((u64::from(in_rate.max(4000)) << 16) / u64::from(self.out_rate.max(8000))).max(1024);
         let mut slot = ActiveSfxVoice {
             active: pcm_len > 1,
             sfx_id,
@@ -1230,7 +1245,12 @@ impl DoomSfxMixer {
             data_ptr_idx: pool_offset,
             data_len: pcm_len,
         };
-        Self::compute_gains(vol_0_127, sep_0_255, &mut slot.gain_l_q8, &mut slot.gain_r_q8);
+        Self::compute_gains(
+            vol_0_127,
+            sep_0_255,
+            &mut slot.gain_l_q8,
+            &mut slot.gain_r_q8,
+        );
         self.voices[ch] = slot;
     }
 
@@ -1315,8 +1335,18 @@ mod tests {
         let mut player = DoomMusicPlayer::new(48_000);
         // Minimal MUS\x1a song: Play Note 60 vol 120 on ch 0 with 14-tick delay, then Score End.
         let mus_song: [u8; 13] = [
-            b'M', b'U', b'S', 0x1A, 5, 0, 8, 0, // score_len=5, score_start=8
-            0x90, 0x80 | 60, 120, 14, // last=1, PlayNote ch=0, note=60+vol=120, delay=14 ticks
+            b'M',
+            b'U',
+            b'S',
+            0x1A,
+            5,
+            0,
+            8,
+            0, // score_len=5, score_start=8
+            0x90,
+            0x80 | 60,
+            120,
+            14,   // last=1, PlayNote ch=0, note=60+vol=120, delay=14 ticks
             0x60, // Score End
         ];
         assert!(player.register_song(&mus_song));

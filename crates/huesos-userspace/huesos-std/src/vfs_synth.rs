@@ -401,9 +401,9 @@ fn execute_audio_ctl_line(line: &str) -> Result<()> {
         }
         "bt-connect" => {
             let addr = match parts.next() {
-                Some(raw) => Some(
-                    net::parse_bd_addr(raw).ok_or(Error::new(ErrorKind::InvalidInput))?,
-                ),
+                Some(raw) => {
+                    Some(net::parse_bd_addr(raw).ok_or(Error::new(ErrorKind::InvalidInput))?)
+                }
                 None => None,
             };
             audio::connect_btl_sink(addr)
@@ -487,8 +487,8 @@ impl SynthFile {
         match self {
             Self::Snapshot(_) => Err(Error::capability()),
             Self::BtlCtl(_) => {
-                let text = core::str::from_utf8(src)
-                    .map_err(|_| Error::new(ErrorKind::InvalidInput))?;
+                let text =
+                    core::str::from_utf8(src).map_err(|_| Error::new(ErrorKind::InvalidInput))?;
                 for line in text.lines() {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
@@ -498,8 +498,8 @@ impl SynthFile {
                 Ok(src.len())
             }
             Self::AudioCtl(_) => {
-                let text = core::str::from_utf8(src)
-                    .map_err(|_| Error::new(ErrorKind::InvalidInput))?;
+                let text =
+                    core::str::from_utf8(src).map_err(|_| Error::new(ErrorKind::InvalidInput))?;
                 for line in text.lines() {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {

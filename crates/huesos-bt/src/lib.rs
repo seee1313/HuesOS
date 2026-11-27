@@ -72,7 +72,10 @@ mod tests {
         assert_eq!(assembled_b.chip_id, 2);
         assert_eq!(assembled_b.payload.len(), 21668 + cfg.len());
         let frags = assembled_b.fragment_count();
-        assert_eq!(frags, assembled_b.payload.len().div_ceil(RTL_DOWNLOAD_CHUNK_DATA));
+        assert_eq!(
+            frags,
+            assembled_b.payload.len().div_ceil(RTL_DOWNLOAD_CHUNK_DATA)
+        );
 
         let mut cmd_buf = [0u8; 260];
         let Some(first_len) = assembled_b.encode_download_cmd(0, &mut cmd_buf) else {
@@ -80,7 +83,10 @@ mod tests {
             return;
         };
         assert_eq!(first_len, 3 + 1 + RTL_DOWNLOAD_CHUNK_DATA);
-        assert_eq!(u16::from_le_bytes([cmd_buf[0], cmd_buf[1]]), OP_RTL_DOWNLOAD);
+        assert_eq!(
+            u16::from_le_bytes([cmd_buf[0], cmd_buf[1]]),
+            OP_RTL_DOWNLOAD
+        );
         assert_eq!(cmd_buf[3], 0x00);
 
         let Some(last_len) = assembled_b.encode_download_cmd(frags - 1, &mut cmd_buf) else {

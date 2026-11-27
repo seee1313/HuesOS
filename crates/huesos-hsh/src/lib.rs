@@ -334,9 +334,9 @@ mod tests {
 
     #[test]
     fn test_caps_net_and_wlan_attenuation() {
-        let Ok(ro) = CapsSpec::parse(
-            "hxfs=none, bootfs=none, fb=none, net=ro, wlan=ro, btl=ro, audio=ro",
-        ) else {
+        let Ok(ro) =
+            CapsSpec::parse("hxfs=none, bootfs=none, fb=none, net=ro, wlan=ro, btl=ro, audio=ro")
+        else {
             assert!(false, "parse net=ro, wlan=ro, btl=ro, audio=ro");
             return;
         };

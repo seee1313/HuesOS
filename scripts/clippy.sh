@@ -153,6 +153,11 @@ run_clippy_suite() {
     )
 
     (
+        cd crates/huesos-userspace/btl-service
+        cargo clippy --release --features boot-selftest -- -D warnings
+    )
+
+    (
         cd crates/huesos-userspace/hsh-bin
         cargo clippy --release --features boot-selftest -- -D warnings
     )

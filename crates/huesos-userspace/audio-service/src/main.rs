@@ -228,7 +228,13 @@ fn btl_l2cap_send(ch: &Channel, cid: u16, sdu: &[u8]) -> Result<(u16, u8), BtlSt
     payload[2..4].copy_from_slice(&(sdu.len() as u16).to_le_bytes());
     payload[4..4 + sdu.len()].copy_from_slice(sdu);
     let mut rep = [0u8; 32];
-    let n = btl_rpc(ch, BtlOp::L2capSend, &payload[..4 + sdu.len()], 300, &mut rep)?;
+    let n = btl_rpc(
+        ch,
+        BtlOp::L2capSend,
+        &payload[..4 + sdu.len()],
+        300,
+        &mut rep,
+    )?;
     if n < 12 {
         return Err(BtlStatus::InvalidRequest);
     }
@@ -484,7 +490,10 @@ impl AudioRuntime {
         }
     }
 
-    fn lookup_btl_peer(&self, target_addr: [u8; 6]) -> Option<([u8; 6], [u8; MAX_SINK_NAME_LEN], u8)> {
+    fn lookup_btl_peer(
+        &self,
+        target_addr: [u8; 6],
+    ) -> Option<([u8; 6], [u8; MAX_SINK_NAME_LEN], u8)> {
         let ch = self.btl_ch.as_ref()?;
         let mut rep = [0u8; 1100];
         let n = btl_rpc(ch, BtlOp::ListPeers, &[], 500, &mut rep).ok()?;
@@ -499,7 +508,8 @@ impl AudioRuntime {
                 break;
             }
             if let Some(peer) = BtlPeerInfo::decode(&rep[off..off + BtlPeerInfo::WIRE_LEN]) {
-                if (want_any && peer.is_audio_sink()) || (!want_any && peer.bd_addr == target_addr) {
+                if (want_any && peer.is_audio_sink()) || (!want_any && peer.bd_addr == target_addr)
+                {
                     let mut name = [0u8; MAX_SINK_NAME_LEN];
                     let take = usize::from(peer.name_len).min(MAX_SINK_NAME_LEN);
                     name[..take].copy_from_slice(&peer.name[..take]);
@@ -772,7 +782,8 @@ impl AudioRuntime {
             let Some(hdr) = load_header(&slot.ring) else {
                 continue;
             };
-            slot.resampler.set_rates(hdr.sample_rate, self.mix_sample_rate);
+            slot.resampler
+                .set_rates(hdr.sample_rate, self.mix_sample_rate);
             // Pull proportional number of input frames for this quantum
             let want_in = (((MIX_QUANTUM_FRAMES as u64) * u64::from(hdr.sample_rate))
                 / u64::from(self.mix_sample_rate.max(8_000)))
@@ -910,7 +921,8 @@ impl AudioRuntime {
                     self.btl_rtp_packets = self.btl_rtp_packets.saturating_add(1);
                     // Derive synthetic `(in_flight, max_slots)` from `/net/btl` congestion telemetry
                     let max_slots = avail_credits.saturating_add(4).max(8);
-                    let in_flight = ((u32::from(max_slots) * u32::from(congestion_pct)) / 100) as u16;
+                    let in_flight =
+                        ((u32::from(max_slots) * u32::from(congestion_pct)) / 100) as u16;
                     let next_bp = sink.bitpool_ctrl.observe_acl_load(in_flight, max_slots);
                     sink.encoder.set_bitpool(next_bp);
                 }
@@ -1065,8 +1077,7 @@ impl AudioRuntime {
                 }
                 if let (Some(btl_ch), Some(sink)) = (self.btl_ch.as_ref(), self.btl_sink.as_mut()) {
                     if let Some(acid) = sink.avctp_cid {
-                        let vol_127 =
-                            ((u16::from(self.master_volume_pct) * 127 + 50) / 100) as u8;
+                        let vol_127 = ((u16::from(self.master_volume_pct) * 127 + 50) / 100) as u8;
                         let (pdu, len) = sink.avrcp.encode_set_absolute_volume(vol_127);
                         let _ = btl_l2cap_send(btl_ch, acid, &pdu[..len]);
                     }

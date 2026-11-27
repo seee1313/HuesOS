@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "btl-service"
+name = "huesos-btl-service"
 path = "src/main.rs"
 
 [features]

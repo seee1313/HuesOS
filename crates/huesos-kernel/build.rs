@@ -149,7 +149,7 @@ fn main() {
         "huesos-btl-service",
         profile,
         &[],
-        &[],
+        wlan_service_args,
     );
     let audio_service = build_userspace_program(
         &userspace_root,

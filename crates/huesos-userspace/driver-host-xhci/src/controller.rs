@@ -853,14 +853,18 @@ impl XhciController {
                 return None;
             }
             let head = usize::from(hw.bt_rx_head) % BT_RX_FIFO_SLOTS;
-            let len = usize::from(hw.bt_rx_lens[head]).min(dst.len()).min(BT_RX_SLOT_STRIDE);
+            let len = usize::from(hw.bt_rx_lens[head])
+                .min(dst.len())
+                .min(BT_RX_SLOT_STRIDE);
             hw.bt_rx_head = ((head + 1) % BT_RX_FIFO_SLOTS) as u8;
             hw.bt_rx_count = hw.bt_rx_count.saturating_sub(1);
             (head, len)
         };
         if pkt_len > 0 {
-            self.dma
-                .copy_out(BT_RX_FIFO_OFF + slot_idx * BT_RX_SLOT_STRIDE, &mut dst[..pkt_len]);
+            self.dma.copy_out(
+                BT_RX_FIFO_OFF + slot_idx * BT_RX_SLOT_STRIDE,
+                &mut dst[..pkt_len],
+            );
         }
         Some(pkt_len)
     }
@@ -959,14 +963,7 @@ impl XhciController {
         true
     }
 
-    fn arm_bt_rx_pipe(
-        &self,
-        slot_id: u8,
-        dci: u8,
-        ring_idx: u8,
-        buf_off: usize,
-        xfer_len: u16,
-    ) {
+    fn arm_bt_rx_pipe(&self, slot_id: u8, dci: u8, ring_idx: u8, buf_off: usize, xfer_len: u16) {
         let mut hw = self.hw.borrow_mut();
         let d_idx = usize::from(slot_id.saturating_sub(1));
         if d_idx >= MAX_SLOTS || !hw.devices[d_idx].active || !hw.devices[d_idx].bt.active {
@@ -2646,7 +2643,11 @@ impl XhciController {
                 &self.dma,
                 r,
                 r_idx,
-                Trb::xfer_data(self.dma_phys + BT_CMD_OUT_OFF as u64, cmd.len() as u32, false),
+                Trb::xfer_data(
+                    self.dma_phys + BT_CMD_OUT_OFF as u64,
+                    cmd.len() as u32,
+                    false,
+                ),
             );
             let status_phys = enqueue_xfer_trb(&self.dma, r, r_idx, Trb::xfer_status(true));
             self.completions
@@ -2679,8 +2680,14 @@ impl XhciController {
             dev.bt
         };
         self.dma.copy_in(BT_ACL_OUT_OFF, acl);
-        self.bulk_xfer_dma(slot_id, bt.acl_out_dci, bt.acl_out_ring, BT_ACL_OUT_OFF, acl.len())
-            .await
+        self.bulk_xfer_dma(
+            slot_id,
+            bt.acl_out_dci,
+            bt.acl_out_ring,
+            BT_ACL_OUT_OFF,
+            acl.len(),
+        )
+        .await
     }
 
     async fn submit_command(&self, cmd_trb: Trb) -> Result<TrbOutcome, UsbError> {
