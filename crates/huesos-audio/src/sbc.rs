@@ -822,8 +822,9 @@ impl SbcEncoder {
                 let pos = i + j * 16;
                 acc += i64::from(PROTO_8_Q31[pos]) * i64::from(hist[pos]);
             }
-            // Scale Q31 * Q0 -> Q16 so cosine Q14 product >> 14 lands in Q15 (`0x8000` = full scale).
-            y[i] = acc >> 15;
+            // Scale Q31 * Q0 -> Q14 (`acc >> 17`) so cosine Q14 product `>> 14` lands in Q14
+            // (`1 << 14 = 1.0 PCM unit`, matching `0x8000 << scf` = `2^(scf + 1)` in Q14).
+            y[i] = acc >> 17;
         }
 
         let mut sb_out = [0i32; 8];
@@ -855,7 +856,7 @@ impl SbcEncoder {
                 let pos = i + j * 8;
                 acc += i64::from(PROTO_4_Q31[pos]) * i64::from(hist[pos]);
             }
-            y[i] = acc >> 15;
+            y[i] = acc >> 17;
         }
 
         let mut sb_out = [0i32; 4];
@@ -1020,10 +1021,11 @@ impl SbcEncoder {
                     if nbits > 0 {
                         let scf = scale_factors[ch][sb];
                         let levels = (1u64 << nbits) - 1;
-                        // sb_samples is in Q15 where `1 << (scf + 15)` is the subband peak `2^(scf+1)`.
-                        let shifted = (i64::from(sb_samples[blk][ch][sb]) >> 15) + (1i64 << scf);
+                        // `sb_samples` is Q14 (`1 << 14 = 1.0 PCM unit`), so `1 << (scf + 15)`
+                        // is the subband peak `2^(scf + 1)` in Q14 (`A2DP v1.3 §12.5.5`).
+                        let shifted = i64::from(sb_samples[blk][ch][sb]) + (1i64 << (scf + 15));
                         let clamped = shifted.max(0) as u64;
-                        let quant = ((clamped * levels) >> (scf + 1)).min(levels) as u32;
+                        let quant = ((clamped * levels) >> (scf + 16)).min(levels) as u32;
                         writer.push_bits(quant, nbits)?;
                     }
                 }
@@ -1140,10 +1142,11 @@ impl SbcDecoder {
             let mut acc = 0i64;
             for i in 0..10 {
                 let pos = j + 8 * i;
-                // D[pos] = -8 * C[pos]; combined shift restores PCM S16 amplitude at unity gain.
+                // `u` is Q12 (`(Q14 * Q14) >> 16`) and `PROTO_8_Q31` is Q31 (`Q43` product);
+                // `D[pos] = -8 * C[pos]` (`Q3`), so `>> 40` restores unity-gain PCM S16.
                 acc += i64::from(u[pos]) * (-i64::from(PROTO_8_Q31[pos]));
             }
-            let sample = (acc >> 26).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+            let sample = (acc >> 40).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
             out[j] = sample as i16;
         }
         out
@@ -1177,9 +1180,10 @@ impl SbcDecoder {
             let mut acc = 0i64;
             for i in 0..10 {
                 let pos = j + 4 * i;
+                // `D[pos] = -4 * C[pos]` (`Q2`), so `>> 41` restores unity-gain PCM S16.
                 acc += i64::from(u[pos]) * (-i64::from(PROTO_4_Q31[pos]));
             }
-            let sample = (acc >> 27).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+            let sample = (acc >> 41).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
             out[j] = sample as i16;
         }
         out
