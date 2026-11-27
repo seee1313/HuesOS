@@ -1031,9 +1031,8 @@ impl SbcEncoder {
         }
 
         let written = writer.finish()?;
-        while written < expected_bytes {
-            out_frame[written] = 0;
-            break;
+        if written < expected_bytes {
+            out_frame[written..expected_bytes].fill(0);
         }
 
         // Compute CRC-8 over byte 1, byte 2, join flags (if JS), and all 4-bit scale factors.
