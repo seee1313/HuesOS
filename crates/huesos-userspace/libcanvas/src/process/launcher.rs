@@ -1018,7 +1018,7 @@ fn map_dynamic_initial_stack(
     top_page[rand_off + 8..rand_off + 16].copy_from_slice(&r1.to_le_bytes());
     let rand_va = top_page_va + rand_off as u64;
 
-    let aux_entries: [(u64, u64); 25] = [
+    let aux_entries: [(u64, u64); 27] = [
         (AT_PHDR, at_phdr),
         (AT_PHENT, u64::from(at_phent)),
         (AT_PHNUM, u64::from(at_phnum)),

@@ -489,10 +489,8 @@ pub fn parse_eir_data(eir: &[u8], out_name: &mut [u8; 64]) -> (u8, bool) {
         let payload = &eir[pos + 2..pos + 1 + field_len];
         match ad_type {
             // Shortened (0x08) or Complete (0x09) Local Name
-            0x08 | 0x09 => {
-                if ad_type == 0x09 || name_len == 0 {
-                    name_len = sanitize_bt_name(payload, out_name);
-                }
+            0x08 | 0x09 if ad_type == 0x09 || name_len == 0 => {
+                name_len = sanitize_bt_name(payload, out_name);
             }
             // Incomplete (0x02) or Complete (0x03) list of 16-bit Service Class UUIDs
             0x02 | 0x03 => {
@@ -714,7 +712,7 @@ pub fn decode_event(pkt: &[u8]) -> Option<DecodedHciEvent<'_>> {
         EVT_INQUIRY_COMPLETE if !p.is_empty() => {
             Some(DecodedHciEvent::InquiryComplete { status: p[0] })
         }
-        EVT_INQUIRY_RESULT if p.len() >= 1 + 14 && p[0] >= 1 => {
+        EVT_INQUIRY_RESULT if p.len() > 14 && p[0] >= 1 => {
             let mut addr = [0u8; 6];
             addr.copy_from_slice(&p[1..7]);
             let psrm = p[7];
@@ -731,7 +729,7 @@ pub fn decode_event(pkt: &[u8]) -> Option<DecodedHciEvent<'_>> {
                 advertises_a2dp_sink: cod.is_audio_sink_candidate(),
             }))
         }
-        EVT_INQUIRY_RESULT_RSSI if p.len() >= 1 + 14 && p[0] >= 1 => {
+        EVT_INQUIRY_RESULT_RSSI if p.len() > 14 && p[0] >= 1 => {
             let mut addr = [0u8; 6];
             addr.copy_from_slice(&p[1..7]);
             let psrm = p[7];

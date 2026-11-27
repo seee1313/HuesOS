@@ -14,6 +14,9 @@
     clippy::type_complexity,
     clippy::collapsible_if,
     clippy::collapsible_else_if,
+    clippy::collapsible_match,
+    clippy::vec_init_then_push,
+    clippy::int_plus_one,
     clippy::single_match
 )]
 

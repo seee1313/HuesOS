@@ -198,11 +198,9 @@ impl Default for L2capEngine {
 impl L2capEngine {
     /// Construct a fresh L2CAP engine with `PSM_SDP` (`0x0001`) always registered.
     pub fn new() -> Self {
-        let mut psms = Vec::new();
-        psms.push(PSM_SDP);
         Self {
             channels: Vec::new(),
-            registered_psms: psms,
+            registered_psms: alloc::vec![PSM_SDP],
             next_cid: DYNAMIC_CID_START,
             next_ident: 1,
             tx_queue: Vec::new(),
