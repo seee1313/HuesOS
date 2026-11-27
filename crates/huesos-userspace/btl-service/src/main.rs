@@ -511,6 +511,7 @@ struct ActiveAclLink {
     reasm: AclReassembler,
 }
 
+#[allow(dead_code)]
 struct ClientL2capEndpoint {
     owner_client_id: u32,
     local_cid: u16,

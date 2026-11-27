@@ -14,8 +14,8 @@ use huesos_abi::auxv::caps_mask;
 use huesos_abi::hxfs::rights as hxfs_rights;
 use huesos_abi::term_ipc::{hsh_to_term, put_u16, term_to_hsh, MAX_WRITE_CHUNK};
 use huesos_hsh::{
-    CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, NetAccess, PipelineCommand,
-    ShellHost, Table, Value, WlanAccess,
+    AudioAccess, BtlAccess, CapsSpec, ExecOutcome, FbAccess, HostPathKind, HxfsAccess, NetAccess,
+    PipelineCommand, ShellHost, Table, Value, WlanAccess,
 };
 use libcanvas::process::{spawn_elf_from_vmo_with_caps, Process, SpawnCaps};
 use libcanvas::{wait_any, Channel, ErrorCode, Handle, Hxfs, Signals, Vmo, WaitItem};
@@ -1210,6 +1210,31 @@ impl HshHost {
                 && (self.pwd == "/mnt"
                     || self.pwd.starts_with("/mnt/")
                     || owned_args.iter().any(|a| arg_touches_usb_mount(a))));
+        let needs_net = command_uses_net_service(&resolved)
+            || (!dir_confined
+                && (self.pwd == "/net"
+                    || (self.pwd.starts_with("/net/")
+                        && !self.pwd.starts_with("/net/btl")
+                        && !self.pwd.starts_with("/net/wlan"))
+                    || owned_args.iter().any(|a| arg_touches_net_vfs(a))));
+        let needs_wlan = command_uses_wlan_service(&resolved)
+            || (!dir_confined
+                && (self.pwd == "/net"
+                    || self.pwd == "/net/wlan"
+                    || self.pwd.starts_with("/net/wlan/")
+                    || owned_args.iter().any(|a| arg_touches_wlan_vfs(a))));
+        let needs_btl = command_uses_btl_service(&resolved)
+            || (!dir_confined
+                && (self.pwd == "/net"
+                    || self.pwd == "/net/btl"
+                    || self.pwd.starts_with("/net/btl/")
+                    || owned_args.iter().any(|a| arg_touches_btl_vfs(a))));
+        let needs_audio = command_uses_audio_service(&resolved)
+            || (!dir_confined
+                && (self.pwd == "/dev"
+                    || self.pwd == "/dev/audio"
+                    || self.pwd.starts_with("/dev/audio/")
+                    || owned_args.iter().any(|a| arg_touches_audio_vfs(a))));
 
         let mask = caps.map_or(caps_mask::ALL_DEFAULT, CapsSpec::to_caps_mask);
         self.try_connect_hxfs();
@@ -1219,6 +1244,8 @@ impl HshHost {
         let mut query_holder: Option<Channel> = None;
         let mut net_holder: Option<Channel> = None;
         let mut wlan_holder: Option<Channel> = None;
+        let mut btl_holder: Option<Channel> = None;
+        let mut audio_holder: Option<Channel> = None;
 
         if let Some(spec) = caps {
             if let Some(dir_grant) = &spec.dir {
@@ -1252,11 +1279,17 @@ impl HshHost {
             if (mask & caps_mask::QUERY_RO) != 0 && needs_query {
                 query_holder = self.open_query_fresh();
             }
-            if spec.net != NetAccess::None && command_uses_net_service(&resolved) {
+            if spec.net != NetAccess::None && needs_net {
                 net_holder = self.open_net_fresh(spec.net == NetAccess::ReadOnly);
             }
-            if spec.wlan != WlanAccess::None && command_uses_wlan_service(&resolved) {
+            if spec.wlan != WlanAccess::None && needs_wlan {
                 wlan_holder = self.open_wlan_fresh(spec.wlan == WlanAccess::ReadOnly);
+            }
+            if spec.btl != BtlAccess::None && needs_btl {
+                btl_holder = self.open_btl_fresh(spec.btl == BtlAccess::ReadOnly);
+            }
+            if spec.audio != AudioAccess::None && needs_audio {
+                audio_holder = self.open_audio_fresh(spec.audio == AudioAccess::ReadOnly);
             }
         } else {
             if let Some(hxfs) = self.hxfs.as_ref() {
@@ -1271,11 +1304,17 @@ impl HshHost {
             if needs_query {
                 query_holder = self.open_query_fresh();
             }
-            if command_uses_net_service(&resolved) {
+            if needs_net {
                 net_holder = self.open_net_fresh(false);
             }
-            if command_uses_wlan_service(&resolved) {
+            if needs_wlan {
                 wlan_holder = self.open_wlan_fresh(false);
+            }
+            if needs_btl {
+                btl_holder = self.open_btl_fresh(false);
+            }
+            if needs_audio {
+                audio_holder = self.open_audio_fresh(false);
             }
         }
 
@@ -1311,6 +1350,8 @@ impl HshHost {
         spawn_caps.registry = query_holder.as_ref();
         spawn_caps.net_service = net_holder.as_ref();
         spawn_caps.wlan_service = wlan_holder.as_ref();
+        spawn_caps.btl_service = btl_holder.as_ref();
+        spawn_caps.audio_service = audio_holder.as_ref();
 
         let spawned =
             spawn_elf_from_vmo_with_caps(&resolved, &elf_vmo, off, len, lib_vmo, &spawn_caps);
@@ -1320,6 +1361,8 @@ impl HshHost {
         drop(query_holder);
         drop(net_holder);
         drop(wlan_holder);
+        drop(btl_holder);
+        drop(audio_holder);
         drop(elf_vmo);
 
         let (process, child_bootstrap) = spawned.map_err(|error| {
@@ -2954,7 +2997,8 @@ impl ShellHost for HshHost {
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
         let abs = self.normalize_path(path);
         if abs.starts_with("/net/btl/") || abs.starts_with("/dev/audio/") {
-            let out = self.spawn_external(None, "cat", &[abs.clone()], None, true, false);
+            let out =
+                self.spawn_external(None, "cat", core::slice::from_ref(&abs), None, true, false);
             return if out.status == 0 {
                 Ok(out.output.into_text().into_bytes())
             } else {

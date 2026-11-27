@@ -273,11 +273,7 @@ fn run() -> i32 {
     stream.drain(600);
 
     let frame_bytes = usize::from(hdr.channels) * usize::from(hdr.bits_per_sample / 8);
-    let frames = if frame_bytes > 0 {
-        hdr.data_len / frame_bytes
-    } else {
-        0
-    };
+    let frames = hdr.data_len.checked_div(frame_bytes).unwrap_or(0);
     cu::outln(&format!(
         "aplay: played '{}' ({}Hz, {}ch, {}-bit, {} frames) on HARB stream #{}",
         path,
