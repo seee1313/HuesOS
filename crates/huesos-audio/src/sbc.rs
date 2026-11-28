@@ -158,7 +158,7 @@ pub enum SbcError {
 }
 
 /// Negotiated SBC configuration (default: High-Quality A2DP 48 kHz Joint Stereo,
-/// 16 blocks, 8 subbands, Loudness, bitpool 53 = ~345 kbps).
+/// 16 blocks, 8 subbands, Loudness, bitpool 53 = 357 kbps).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SbcConfig {
     pub sample_rate: SbcSampleRate,
@@ -591,7 +591,7 @@ fn compute_bit_allocation(
 
                 let mut sb2 = 0usize;
                 while bitcount < bitpool && sb2 < sb_count {
-                    if bits_out[ch][sb2] < 16 {
+                    if bits_out[ch][sb2] >= 2 && bits_out[ch][sb2] < 16 {
                         bits_out[ch][sb2] += 1;
                         bitcount += 1;
                     }
@@ -670,7 +670,7 @@ fn compute_bit_allocation(
                     if bitcount >= bitpool {
                         break;
                     }
-                    if bits_out[ch][sb2] < 16 {
+                    if bits_out[ch][sb2] >= 2 && bits_out[ch][sb2] < 16 {
                         bits_out[ch][sb2] += 1;
                         bitcount += 1;
                     }
@@ -1025,7 +1025,8 @@ impl SbcEncoder {
                         // is the subband peak `2^(scf + 1)` in Q14 (`A2DP v1.3 §12.5.5`).
                         let shifted = i64::from(sb_samples[blk][ch][sb]) + (1i64 << (scf + 15));
                         let clamped = shifted.max(0) as u64;
-                        let quant = ((clamped * levels) >> (scf + 16)).min(levels) as u32;
+                        let quant =
+                            ((clamped * levels) >> (scf + 16)).min(levels.saturating_sub(1)) as u32;
                         writer.push_bits(quant, nbits)?;
                     }
                 }
@@ -1421,7 +1422,7 @@ mod tests {
         let cfg = SbcConfig::HQ_48K_JOINT_STEREO;
         assert_eq!(cfg.pcm_frames_per_sbc_frame(), 128);
         assert_eq!(cfg.frame_byte_len(), 119);
-        assert!(cfg.bitrate_bps() > 340_000 && cfg.bitrate_bps() < 350_000);
+        assert_eq!(cfg.bitrate_bps(), 357_000);
 
         let mut enc = SbcEncoder::new(cfg);
         let mut dec = SbcDecoder::new();
