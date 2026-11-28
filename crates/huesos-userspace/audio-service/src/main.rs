@@ -30,7 +30,9 @@ use huesos_abi::audio::{
     self, AudioOp, AudioRouteMode, AudioStatus, AudioStatusSnapshot, SndDriverOp,
     MAX_SINK_NAME_LEN, SND_DRIVER_MAGIC, VERSION as AUDIO_ABI_VERSION,
 };
-use huesos_abi::btl::{self, BtlOp, BtlPeerInfo, BtlStatus, MAX_L2CAP_IPC_PAYLOAD};
+use huesos_abi::btl::{
+    self, BtlOp, BtlPeerInfo, BtlStatus, BtlStatusSnapshot, BtlTransportKind, MAX_L2CAP_IPC_PAYLOAD,
+};
 use huesos_audio::avdtp_avrcp::{
     AvdtpAction, AvdtpSourceSession, AvdtpState, AvrcpButton, AvrcpEvent, AvrcpSession, PSM_AVCTP,
     PSM_AVDTP,
@@ -183,6 +185,14 @@ fn btl_rpc(
     if 8 + payload.len() > 1100 {
         return Err(BtlStatus::InvalidRequest);
     }
+    // Drain any stale reply left by an earlier timed-out RPC so framing stays synchronized.
+    let mut stale = [0u8; 1100];
+    for _drain in 0..8u32 {
+        if ch.read_into(&mut stale).is_err() {
+            break;
+        }
+    }
+
     let mut req = [0u8; 1100];
     btl::write_header(&mut req, op, BtlStatus::Ok);
     req[8..8 + payload.len()].copy_from_slice(payload);
@@ -199,6 +209,9 @@ fn btl_rpc(
     for _budget in 0..2048u32 {
         match ch.read_into(out) {
             Ok(n) => {
+                if n >= 8 && out[6] != (op as u8) {
+                    continue;
+                }
                 let st = btl::check_header(&out[..n], op)?;
                 if st == BtlStatus::Ok {
                     return Ok(n);
@@ -244,7 +257,7 @@ fn btl_l2cap_send(ch: &Channel, cid: u16, sdu: &[u8]) -> Result<(u16, u8), BtlSt
         ch,
         BtlOp::L2capSend,
         &payload[..4 + sdu.len()],
-        300,
+        800,
         &mut rep,
     )?;
     if n < 12 {
@@ -261,7 +274,7 @@ fn btl_l2cap_recv(ch: &Channel, cid: u16, out_sdu: &mut [u8]) -> Result<usize, B
     payload[0..2].copy_from_slice(&cid.to_le_bytes());
     payload[2..4].copy_from_slice(&max_want.to_le_bytes());
     let mut rep = [0u8; 1100];
-    let n = btl_rpc(ch, BtlOp::L2capRecv, &payload, 50, &mut rep)?;
+    let n = btl_rpc(ch, BtlOp::L2capRecv, &payload, 250, &mut rep)?;
     if n < 12 {
         return Err(BtlStatus::InvalidRequest);
     }
@@ -273,20 +286,34 @@ fn btl_l2cap_recv(ch: &Channel, cid: u16, out_sdu: &mut [u8]) -> Result<usize, B
     Ok(dlen)
 }
 
+fn btl_l2cap_listen(ch: &Channel, psm: u16) -> bool {
+    let mut rep = [0u8; 16];
+    btl_rpc(ch, BtlOp::L2capListen, &psm.to_le_bytes(), 1_500, &mut rep).is_ok()
+}
+
+fn btl_l2cap_accept(ch: &Channel, psm: u16) -> Result<(u16, u16, [u8; 6]), BtlStatus> {
+    let mut rep = [0u8; 32];
+    let n = btl_rpc(ch, BtlOp::L2capAccept, &psm.to_le_bytes(), 250, &mut rep)?;
+    if n < 18 {
+        return Err(BtlStatus::InvalidRequest);
+    }
+    let cid = u16::from_le_bytes([rep[8], rep[9]]);
+    let mtu = u16::from_le_bytes([rep[10], rep[11]]);
+    let mut addr = [0u8; 6];
+    addr.copy_from_slice(&rep[12..18]);
+    Ok((cid, mtu, addr))
+}
+
 fn btl_l2cap_close(ch: &Channel, cid: u16) {
     let mut rep = [0u8; 16];
-    let _ = btl_rpc(ch, BtlOp::L2capClose, &cid.to_le_bytes(), 200, &mut rep);
+    let _ = btl_rpc(ch, BtlOp::L2capClose, &cid.to_le_bytes(), 500, &mut rep);
 }
 
 fn btl_set_coex_hint(ch: &Channel, streaming: bool) {
     let mut rep = [0u8; 16];
-    let _ = btl_rpc(
-        ch,
-        BtlOp::SetCoexHint,
-        &[u8::from(streaming)],
-        200,
-        &mut rep,
-    );
+    // Profile `2` = high-priority A2DP streaming PTA weights; `0` = balanced.
+    let profile = if streaming { 2u8 } else { 0u8 };
+    let _ = btl_rpc(ch, BtlOp::SetCoexHint, &[profile], 500, &mut rep);
 }
 
 // ============================================================================
@@ -337,6 +364,7 @@ struct ActiveBtlA2dpSink {
     avctp_cid: Option<u16>,
     avdtp: AvdtpSourceSession,
     avrcp: AvrcpSession,
+    sink_resampler: LinearResampler,
     encoder: SbcEncoder,
     bitpool_ctrl: AdaptiveBitpool,
     rtp: RtpSbcPacketizer,
@@ -370,6 +398,11 @@ struct AudioRuntime {
 
     next_mix_us: u64,
     last_hw_poll_ms: u64,
+    last_btl_ctrl_poll_ms: u64,
+    last_btl_autoconn_ms: u64,
+    last_autoconn_fail_addr: [u8; 6],
+    last_autoconn_fail_ms: u64,
+    btl_listeners_registered: bool,
 }
 
 impl AudioRuntime {
@@ -396,6 +429,28 @@ impl AudioRuntime {
             underruns: 0,
             next_mix_us: 0,
             last_hw_poll_ms: 0,
+            last_btl_ctrl_poll_ms: 0,
+            last_btl_autoconn_ms: 0,
+            last_autoconn_fail_addr: [0; 6],
+            last_autoconn_fail_ms: 0,
+            btl_listeners_registered: false,
+        }
+    }
+
+    fn attach_btl_transport(&mut self, ch: Channel) {
+        self.btl_ch = Some(ch);
+        self.btl_listeners_registered = false;
+    }
+
+    fn ensure_btl_listeners(&mut self) {
+        if self.btl_listeners_registered {
+            return;
+        }
+        let Some(ch) = self.btl_ch.as_ref() else {
+            return;
+        };
+        if btl_l2cap_listen(ch, PSM_AVDTP) && btl_l2cap_listen(ch, PSM_AVCTP) {
+            self.btl_listeners_registered = true;
         }
     }
 
@@ -514,48 +569,113 @@ impl AudioRuntime {
         }
         let count = usize::from(rep[8]);
         let want_any = target_addr == [0; 6];
+        let mut best: Option<(u8, [u8; 6], [u8; MAX_SINK_NAME_LEN], u8)> = None;
+
         for i in 0..count {
             let off = 12 + i * BtlPeerInfo::WIRE_LEN;
             if off + BtlPeerInfo::WIRE_LEN > n {
                 break;
             }
-            if let Some(peer) = BtlPeerInfo::decode(&rep[off..off + BtlPeerInfo::WIRE_LEN]) {
-                if (want_any && peer.is_audio_sink()) || (!want_any && peer.bd_addr == target_addr)
-                {
-                    let mut name = [0u8; MAX_SINK_NAME_LEN];
-                    let take = usize::from(peer.name_len).min(MAX_SINK_NAME_LEN);
-                    name[..take].copy_from_slice(&peer.name[..take]);
+            let Some(peer) = BtlPeerInfo::decode(&rep[off..off + BtlPeerInfo::WIRE_LEN]) else {
+                continue;
+            };
+            let mut name = [0u8; MAX_SINK_NAME_LEN];
+            let take = usize::from(peer.name_len).min(MAX_SINK_NAME_LEN);
+            name[..take].copy_from_slice(&peer.name[..take]);
+
+            if !want_any {
+                if peer.bd_addr == target_addr {
                     return Some((peer.bd_addr, name, take as u8));
                 }
+                continue;
+            }
+
+            let rank = if peer.is_connected() && peer.is_audio_sink() {
+                4
+            } else if peer.is_connected() {
+                3
+            } else if peer.is_audio_sink() && peer.is_paired() {
+                2
+            } else if peer.is_audio_sink() {
+                1
+            } else {
+                0
+            };
+            if rank > 0 && best.as_ref().is_none_or(|b| rank > b.0) {
+                best = Some((rank, peer.bd_addr, name, take as u8));
             }
         }
         if want_any {
-            None
+            best.map(|(_, addr, name, len)| (addr, name, len))
         } else {
             Some((target_addr, [0u8; MAX_SINK_NAME_LEN], 0))
         }
     }
 
     fn connect_btl_a2dp(&mut self, requested_addr: [u8; 6]) -> Result<(), AudioStatus> {
+        self.connect_btl_a2dp_inner(requested_addr, None)
+    }
+
+    fn connect_btl_a2dp_inner(
+        &mut self,
+        requested_addr: [u8; 6],
+        given_sig: Option<(u16, u16, [u8; 6])>,
+    ) -> Result<(), AudioStatus> {
+        if given_sig.is_none() {
+            if let Some(existing) = self.btl_sink.as_ref() {
+                if existing.avdtp.state() == AvdtpState::Streaming
+                    && (requested_addr == [0; 6] || existing.peer_addr == requested_addr)
+                {
+                    return Ok(());
+                }
+            }
+        }
         self.disconnect_btl_a2dp();
-        let Some((peer_addr, peer_name, peer_name_len)) = self.lookup_btl_peer(requested_addr)
-        else {
+        self.ensure_btl_listeners();
+
+        let Some(btl_ch_check) = self.btl_ch.as_ref() else {
             return Err(AudioStatus::SinkUnavailable);
         };
+        // Check if the headphones already opened an inbound `PSM_AVDTP` signaling channel!
+        let pre_accepted_sig = given_sig.or_else(|| btl_l2cap_accept(btl_ch_check, PSM_AVDTP).ok());
+
+        let (peer_addr, peer_name, peer_name_len) =
+            if let Some((_, _, inbound_addr)) = pre_accepted_sig {
+                self.lookup_btl_peer(inbound_addr).unwrap_or((
+                    inbound_addr,
+                    [0u8; MAX_SINK_NAME_LEN],
+                    0,
+                ))
+            } else {
+                let Some(found) = self.lookup_btl_peer(requested_addr) else {
+                    return Err(AudioStatus::SinkUnavailable);
+                };
+                found
+            };
+
         let Some(btl_ch) = self.btl_ch.as_ref() else {
             return Err(AudioStatus::SinkUnavailable);
         };
 
-        // Best-effort SDP check for AudioSink (`0x110B`)
-        let mut sdp_req = [0u8; 8];
-        sdp_req[0..6].copy_from_slice(&peer_addr);
-        sdp_req[6..8].copy_from_slice(&UUID_AUDIO_SINK.to_le_bytes());
-        let mut sdp_rep = [0u8; 1100];
-        let _ = btl_rpc(btl_ch, BtlOp::SdpQuery, &sdp_req, 2_500, &mut sdp_rep);
+        let (sig_cid, inbound_sig) = if let Some((scid, _, _)) = pre_accepted_sig {
+            (scid, true)
+        } else {
+            // Best-effort SDP check for AudioSink (`0x110B`)
+            let mut sdp_req = [0u8; 8];
+            sdp_req[0..6].copy_from_slice(&peer_addr);
+            sdp_req[6..8].copy_from_slice(&UUID_AUDIO_SINK.to_le_bytes());
+            let mut sdp_rep = [0u8; 1100];
+            let _ = btl_rpc(btl_ch, BtlOp::SdpQuery, &sdp_req, 2_500, &mut sdp_rep);
 
-        // Open AVDTP signaling L2CAP channel (`PSM 0x0019`)
-        let Ok((sig_cid, _sig_mtu)) = btl_l2cap_connect(btl_ch, peer_addr, PSM_AVDTP) else {
-            return Err(AudioStatus::SinkUnavailable);
+            // Re-check inbound accept in case the headset initiated AVDTP during SDP
+            if let Ok((scid, _, _)) = btl_l2cap_accept(btl_ch, PSM_AVDTP) {
+                (scid, true)
+            } else {
+                let Ok((scid, _sig_mtu)) = btl_l2cap_connect(btl_ch, peer_addr, PSM_AVDTP) else {
+                    return Err(AudioStatus::SinkUnavailable);
+                };
+                (scid, false)
+            }
         };
 
         let mut avdtp = AvdtpSourceSession::new();
@@ -563,19 +683,34 @@ impl AudioRuntime {
         let mut media_mtu: u16 = 672;
         let mut negotiated_cfg: Option<SbcConfig> = None;
 
-        let mut pending_action = avdtp.start_discovery();
-        let deadline = monotonic_ms().saturating_add(4_000);
+        // If headset opened `sig_cid` inbound, give it 160 ms to drive as AVDTP Initiator
+        // before we initiate `AVDTP_DISCOVER`.
+        let mut pending_action = if inbound_sig {
+            AvdtpAction::None
+        } else {
+            avdtp.start_discovery()
+        };
+        let start_ms = monotonic_ms();
+        let deadline = start_ms.saturating_add(5_500);
+        let mut started_our_discovery = !inbound_sig;
 
-        for _budget in 0..512u32 {
+        for _budget in 0..640u32 {
             match pending_action {
                 AvdtpAction::SendSignaling { len, buf } => {
                     if btl_l2cap_send(btl_ch, sig_cid, &buf[..len]).is_err() {
                         break;
                     }
+                    if avdtp.state() == AvdtpState::Streaming && media_cid.is_some() {
+                        negotiated_cfg = Some(avdtp.negotiated_sbc());
+                        break;
+                    }
                     pending_action = AvdtpAction::None;
                 }
                 AvdtpAction::OpenMediaL2capChannel => {
-                    match btl_l2cap_connect(btl_ch, peer_addr, PSM_AVDTP) {
+                    let opened = btl_l2cap_accept(btl_ch, PSM_AVDTP)
+                        .map(|(mcid, mmtu, _)| (mcid, mmtu))
+                        .or_else(|_| btl_l2cap_connect(btl_ch, peer_addr, PSM_AVDTP));
+                    match opened {
                         Ok((mcid, mmtu)) => {
                             media_cid = Some(mcid);
                             media_mtu = mmtu.max(335);
@@ -593,7 +728,28 @@ impl AudioRuntime {
                 AvdtpAction::None => {}
             }
 
-            if matches!(avdtp.state(), AvdtpState::Failed(_)) || monotonic_ms() >= deadline {
+            if avdtp.state() == AvdtpState::WaitingForMediaChannel && media_cid.is_none() {
+                if let Ok((mcid, mmtu, _)) = btl_l2cap_accept(btl_ch, PSM_AVDTP) {
+                    media_cid = Some(mcid);
+                    media_mtu = mmtu.max(335);
+                }
+            }
+            if avdtp.state() == AvdtpState::Streaming && media_cid.is_some() {
+                negotiated_cfg = Some(avdtp.negotiated_sbc());
+                break;
+            }
+
+            let now_ms = monotonic_ms();
+            if !started_our_discovery
+                && avdtp.state() == AvdtpState::Idle
+                && now_ms.saturating_sub(start_ms) >= 160
+            {
+                started_our_discovery = true;
+                pending_action = avdtp.start_discovery();
+                continue;
+            }
+
+            if matches!(avdtp.state(), AvdtpState::Failed(_)) || now_ms >= deadline {
                 break;
             }
 
@@ -603,7 +759,7 @@ impl AudioRuntime {
                     pending_action = avdtp.on_signaling_pdu(&rx_pdu[..n]);
                 }
                 Ok(_) | Err(BtlStatus::WouldBlock) => {
-                    libcanvas::system::sleep_ms(4);
+                    libcanvas::system::sleep_ms(5);
                 }
                 Err(_) => break,
             }
@@ -617,11 +773,12 @@ impl AudioRuntime {
             return Err(AudioStatus::A2dpFailed);
         };
 
-        // Best-effort AVRCP control channel (`PSM 0x0017`)
+        // Best-effort AVRCP control channel (`PSM 0x0017`, inbound first then outbound)
         let mut avrcp = AvrcpSession::new();
-        let avctp_cid = btl_l2cap_connect(btl_ch, peer_addr, PSM_AVCTP)
-            .ok()
-            .map(|(cid, _)| cid);
+        let avctp_cid = btl_l2cap_accept(btl_ch, PSM_AVCTP)
+            .map(|(cid, _, _)| cid)
+            .or_else(|_| btl_l2cap_connect(btl_ch, peer_addr, PSM_AVCTP).map(|(cid, _)| cid))
+            .ok();
         if let Some(acid) = avctp_cid {
             let vol_127 = ((u16::from(self.master_volume_pct.min(100)) * 127) / 100) as u8;
             let (pdu, len) = avrcp.encode_set_absolute_volume(vol_127);
@@ -631,8 +788,8 @@ impl AudioRuntime {
         btl_set_coex_hint(btl_ch, true);
 
         let initial_bp = sbc_cfg.bitpool.clamp(2, 53);
-        let min_bp = 28u8.min(initial_bp);
-        self.btl_sink = Some(ActiveBtlA2dpSink {
+        let min_bp = avdtp.negotiated_min_bitpool().max(24).min(initial_bp);
+        let mut sink = ActiveBtlA2dpSink {
             peer_addr,
             peer_name,
             peer_name_len,
@@ -642,15 +799,46 @@ impl AudioRuntime {
             avctp_cid,
             avdtp,
             avrcp,
+            sink_resampler: LinearResampler::new(self.mix_sample_rate, sbc_cfg.sample_rate.hz()),
             encoder: SbcEncoder::new(sbc_cfg),
             bitpool_ctrl: AdaptiveBitpool::new(min_bp, initial_bp, initial_bp),
             rtp: RtpSbcPacketizer::new(0x4855_4553),
             pcm_fifo: VecDeque::with_capacity(2048),
-        });
+        };
+
+        // Prime 2 silent SBC frames (~5.3 ms) so the headphone DAC unmutes immediately.
+        let zero_pcm = [[0i16; 2]; SBC_MAX_PCM_FRAMES];
+        let mut prime_sbc = [0u8; SBC_MAX_FRAME_BYTES * 2];
+        let mut prime_rtp = [0u8; MAX_L2CAP_IPC_PAYLOAD];
+        let pcm_per_sbc = sbc_cfg.pcm_frames_per_sbc_frame();
+        if let Ok(flen0) = sink
+            .encoder
+            .encode_stereo_frame(&zero_pcm[..pcm_per_sbc], &mut prime_sbc)
+        {
+            if let Ok(flen1) = sink
+                .encoder
+                .encode_stereo_frame(&zero_pcm[..pcm_per_sbc], &mut prime_sbc[flen0..])
+            {
+                if let Ok(plen) = sink.rtp.pack_media_packet(
+                    &prime_sbc[..flen0 + flen1],
+                    2,
+                    (pcm_per_sbc * 2) as u32,
+                    &mut prime_rtp,
+                ) {
+                    let _ = btl_l2cap_send(btl_ch, mcid, &prime_rtp[..plen]);
+                }
+            }
+        }
+
+        self.btl_sink = Some(sink);
+        self.last_autoconn_fail_addr = [0; 6];
         self.sync_virtio_running();
         println!(
-            "[audio-service] A2DP streaming active (bitpool={}, mtu={})",
-            initial_bp, media_mtu
+            "[audio-service] A2DP streaming active (seid={}, rate={}Hz, bitpool={}, mtu={})",
+            avdtp.acp_seid(),
+            sbc_cfg.sample_rate.hz(),
+            initial_bp,
+            media_mtu
         );
         Ok(())
     }
@@ -670,10 +858,49 @@ impl AudioRuntime {
         self.sync_virtio_running();
     }
 
-    fn poll_btl_control_channels(&mut self) {
+    fn poll_btl_control_channels(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_btl_ctrl_poll_ms) < 50 {
+            return;
+        }
+        self.last_btl_ctrl_poll_ms = now_ms;
+
+        if self.btl_sink.is_none() {
+            if self.route_mode == AudioRouteMode::VirtioOnly {
+                return;
+            }
+            if now_ms.saturating_sub(self.last_btl_autoconn_ms) >= 2_000 {
+                self.last_btl_autoconn_ms = now_ms;
+                if !self.is_usb_bt_transport() {
+                    return;
+                }
+                self.ensure_btl_listeners();
+                let inbound = self
+                    .btl_ch
+                    .as_ref()
+                    .and_then(|ch| btl_l2cap_accept(ch, PSM_AVDTP).ok());
+                if let Some((scid, smtu, addr)) = inbound {
+                    let _ = self.connect_btl_a2dp_inner(addr, Some((scid, smtu, addr)));
+                    return;
+                }
+                let auto_addr = self.find_autoconnect_acl_peer(now_ms);
+                if let Some(addr) = auto_addr {
+                    if self.connect_btl_a2dp(addr).is_err() {
+                        self.last_autoconn_fail_addr = addr;
+                        self.last_autoconn_fail_ms = now_ms;
+                    }
+                }
+            }
+            return;
+        }
+
         let (Some(btl_ch), Some(sink)) = (self.btl_ch.as_ref(), self.btl_sink.as_mut()) else {
             return;
         };
+        if sink.avctp_cid.is_none() {
+            if let Ok((acid, _, _)) = btl_l2cap_accept(btl_ch, PSM_AVCTP) {
+                sink.avctp_cid = Some(acid);
+            }
+        }
         let mut drop_sink = false;
         let mut rx_buf = [0u8; 256];
 
@@ -764,9 +991,66 @@ impl AudioRuntime {
         }
     }
 
+    fn is_usb_bt_transport(&self) -> bool {
+        let Some(ch) = self.btl_ch.as_ref() else {
+            return false;
+        };
+        let mut srep = [0u8; 64];
+        let Ok(sn) = btl_rpc(ch, BtlOp::Status, &[], 300, &mut srep) else {
+            return false;
+        };
+        let Ok(st) = BtlStatusSnapshot::decode_reply(&srep[..sn]) else {
+            return false;
+        };
+        matches!(
+            st.transport,
+            BtlTransportKind::UsbRealtek8821c | BtlTransportKind::UsbGenericHci
+        )
+    }
+
+    fn find_autoconnect_acl_peer(&self, now_ms: u64) -> Option<[u8; 6]> {
+        let ch = self.btl_ch.as_ref()?;
+        let mut rep = [0u8; 1100];
+        let n = btl_rpc(ch, BtlOp::ListPeers, &[], 400, &mut rep).ok()?;
+        if n < 12 {
+            return None;
+        }
+        let count = usize::from(rep[8]);
+        for i in 0..count {
+            let off = 12 + i * BtlPeerInfo::WIRE_LEN;
+            if off + BtlPeerInfo::WIRE_LEN > n {
+                break;
+            }
+            let Some(peer) = BtlPeerInfo::decode(&rep[off..off + BtlPeerInfo::WIRE_LEN]) else {
+                continue;
+            };
+            if !peer.is_connected() {
+                continue;
+            }
+            if !peer.is_audio_sink() && self.route_mode != AudioRouteMode::BtlOnly {
+                continue;
+            }
+            if peer.bd_addr == self.last_autoconn_fail_addr
+                && now_ms.saturating_sub(self.last_autoconn_fail_ms) < 10_000
+            {
+                continue;
+            }
+            return Some(peer.bd_addr);
+        }
+        None
+    }
+
     fn pump_mixer(&mut self, now_us: u64) -> bool {
         let has_work = !self.streams.is_empty() || !self.tone_samples.is_empty();
         if !has_work {
+            if self.want_btl_sink()
+                && self
+                    .btl_sink
+                    .as_ref()
+                    .is_some_and(|s| !s.pcm_fifo.is_empty())
+            {
+                self.push_btl_sbc_frames(&[]);
+            }
             self.next_mix_us = 0;
             self.sync_virtio_running();
             return false;
@@ -876,15 +1160,49 @@ impl AudioRuntime {
         let (Some(btl_ch), Some(sink)) = (self.btl_ch.as_ref(), self.btl_sink.as_mut()) else {
             return;
         };
-        for pair in interleaved_pcm.chunks_exact(2) {
-            if sink.pcm_fifo.len() >= 4096 {
-                let _ = sink.pcm_fifo.pop_front();
+        let sink_hz = sink.encoder.config().sample_rate.hz();
+        if !interleaved_pcm.is_empty() {
+            if sink_hz == self.mix_sample_rate {
+                for pair in interleaved_pcm.chunks_exact(2) {
+                    if sink.pcm_fifo.len() >= 4096 {
+                        let _ = sink.pcm_fifo.pop_front();
+                    }
+                    sink.pcm_fifo.push_back([pair[0], pair[1]]);
+                }
+            } else {
+                sink.sink_resampler.set_rates(self.mix_sample_rate, sink_hz);
+                let in_frames = interleaved_pcm.len() / 2;
+                let out_frames = ((in_frames as u64) * u64::from(sink_hz))
+                    .div_ceil(u64::from(self.mix_sample_rate.max(8_000)))
+                    .saturating_add(2)
+                    .clamp(1, (MIX_QUANTUM_FRAMES * 2) as u64)
+                    as usize;
+                let mut rs_accum = [0i32; MIX_QUANTUM_FRAMES * 4];
+                let (_consumed, produced) = sink.sink_resampler.resample_and_accumulate(
+                    interleaved_pcm,
+                    256,
+                    &mut rs_accum[..out_frames * 2],
+                );
+                for i in 0..produced {
+                    if sink.pcm_fifo.len() >= 4096 {
+                        let _ = sink.pcm_fifo.pop_front();
+                    }
+                    let l = rs_accum[i * 2].clamp(-32_768, 32_767) as i16;
+                    let r = rs_accum[i * 2 + 1].clamp(-32_768, 32_767) as i16;
+                    sink.pcm_fifo.push_back([l, r]);
+                }
             }
-            sink.pcm_fifo.push_back([pair[0], pair[1]]);
         }
 
         let cfg = sink.encoder.config();
         let pcm_per_sbc = cfg.pcm_frames_per_sbc_frame();
+        let sources_idle = self.streams.is_empty() && self.tone_samples.is_empty();
+        if sources_idle && !sink.pcm_fifo.is_empty() && (sink.pcm_fifo.len() % pcm_per_sbc) != 0 {
+            let pad = pcm_per_sbc - (sink.pcm_fifo.len() % pcm_per_sbc);
+            for _ in 0..pad {
+                sink.pcm_fifo.push_back([0, 0]);
+            }
+        }
         let sbc_frame_bytes = cfg.frame_byte_len();
         let max_pack = RtpSbcPacketizer::max_frames_per_packet(
             sink.media_mtu.min(MAX_L2CAP_IPC_PAYLOAD as u16),
@@ -897,7 +1215,6 @@ impl AudioRuntime {
         let mut rtp_pkt = [0u8; MAX_L2CAP_IPC_PAYLOAD];
         let mut pcm_block = [[0i16; 2]; SBC_MAX_PCM_FRAMES];
 
-        let sources_idle = self.streams.is_empty() && self.tone_samples.is_empty();
         for _budget in 0..4u32 {
             let avail_sbc_frames = sink.pcm_fifo.len() / pcm_per_sbc;
             let pack_count = if avail_sbc_frames >= max_pack {
@@ -1120,6 +1437,9 @@ impl AudioRuntime {
                     return (8, None);
                 };
                 self.route_mode = mode;
+                if mode == AudioRouteMode::BtlOnly && self.btl_sink.is_none() {
+                    let _ = self.connect_btl_a2dp([0; 6]);
+                }
                 self.sync_virtio_running();
                 audio::write_header(rep, op, AudioStatus::Ok);
                 (8, None)
@@ -1276,7 +1596,7 @@ fn run_service() -> ! {
         }
 
         // 3. Poll Bluetooth AVDTP/AVRCP control channels + VirtIO telemetry + pump mixer
-        rt.poll_btl_control_channels();
+        rt.poll_btl_control_channels(now_ms);
         rt.refresh_snd_telemetry(now_ms);
         if rt.pump_mixer(now_us) {
             did_work = true;
@@ -1320,7 +1640,7 @@ fn accept_bootstrap_handle(
     if tag == b"snd-driver" {
         rt.attach_snd_driver(Channel::from_handle(handle));
     } else if tag == b"btl-transport" {
-        rt.btl_ch = Some(Channel::from_handle(handle));
+        rt.attach_btl_transport(Channel::from_handle(handle));
     } else if tag == b"audio-client:ro"
         || tag == b"audio-client:rw"
         || tag == b"audio-client"

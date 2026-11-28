@@ -96,7 +96,7 @@ impl DoomSoundState {
             return;
         }
         let mut rep = [0u8; 32];
-        let Ok((n, Some(vmo_h))) = ch.read_optional_handle_timeout(&mut rep, 300) else {
+        let Ok((n, Some(vmo_h))) = ch.read_optional_handle_timeout(&mut rep, 800) else {
             return;
         };
         if audio::check_header(&rep[..n], AudioOp::OpenStream) != Ok(AudioStatus::Ok) || n < 16 {

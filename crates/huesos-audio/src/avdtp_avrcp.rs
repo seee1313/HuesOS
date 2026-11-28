@@ -17,6 +17,11 @@ pub const AVDTP_MSG_GENERAL_REJECT: u8 = 0x01;
 pub const AVDTP_MSG_RESPONSE_ACCEPT: u8 = 0x02;
 pub const AVDTP_MSG_RESPONSE_REJECT: u8 = 0x03;
 
+pub const AVDTP_PKT_SINGLE: u8 = 0x00;
+pub const AVDTP_PKT_START: u8 = 0x01;
+pub const AVDTP_PKT_CONTINUE: u8 = 0x02;
+pub const AVDTP_PKT_END: u8 = 0x03;
+
 pub const AVDTP_DISCOVER: u8 = 0x01;
 pub const AVDTP_GET_CAPABILITIES: u8 = 0x02;
 pub const AVDTP_SET_CONFIGURATION: u8 = 0x03;
@@ -35,6 +40,8 @@ pub const AVDTP_CAT_MEDIA_CODEC: u8 = 0x07;
 pub const AVDTP_CAT_DELAY_REPORTING: u8 = 0x08;
 
 pub const LOCAL_SOURCE_SEID: u8 = 1;
+const MAX_CANDIDATE_SEIDS: usize = 8;
+const MAX_REASM_SIG_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AvdtpState {
@@ -60,15 +67,33 @@ pub enum AvdtpAction {
     StreamClosed,
 }
 
+/// Parsed Sink capability inspection result for one SEP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParsedSinkCaps {
+    pub sbc: SbcConfig,
+    pub min_bitpool: u8,
+    pub delay_reporting: bool,
+}
+
 /// Stateful AVDTP 1.3 Audio Source signaling engine (both Initiator and Acceptor).
 #[derive(Clone, Copy, Debug)]
 pub struct AvdtpSourceSession {
     state: AvdtpState,
     tx_label: u8,
     acp_seid: u8,
+    candidate_seids: [u8; MAX_CANDIDATE_SEIDS],
+    candidate_count: u8,
+    candidate_idx: u8,
+    use_legacy_get_caps: bool,
     negotiated_sbc: SbcConfig,
+    negotiated_min_bitpool: u8,
+    delay_reporting_supported: bool,
     delay_tenth_ms: u16,
     media_channel_up: bool,
+    reasm_buf: [u8; MAX_REASM_SIG_BYTES],
+    reasm_len: usize,
+    reasm_hdr0: u8,
+    reasm_sig_id: u8,
 }
 
 impl AvdtpSourceSession {
@@ -78,9 +103,19 @@ impl AvdtpSourceSession {
             state: AvdtpState::Idle,
             tx_label: 1,
             acp_seid: 1,
+            candidate_seids: [0; MAX_CANDIDATE_SEIDS],
+            candidate_count: 0,
+            candidate_idx: 0,
+            use_legacy_get_caps: false,
             negotiated_sbc: SbcConfig::HQ_48K_JOINT_STEREO,
+            negotiated_min_bitpool: 2,
+            delay_reporting_supported: false,
             delay_tenth_ms: 0,
             media_channel_up: false,
+            reasm_buf: [0; MAX_REASM_SIG_BYTES],
+            reasm_len: 0,
+            reasm_hdr0: 0,
+            reasm_sig_id: 0,
         }
     }
 
@@ -90,8 +125,18 @@ impl AvdtpSourceSession {
     }
 
     #[must_use]
+    pub const fn acp_seid(&self) -> u8 {
+        self.acp_seid
+    }
+
+    #[must_use]
     pub const fn negotiated_sbc(&self) -> SbcConfig {
         self.negotiated_sbc
+    }
+
+    #[must_use]
+    pub const fn negotiated_min_bitpool(&self) -> u8 {
+        self.negotiated_min_bitpool
     }
 
     #[must_use]
@@ -122,6 +167,11 @@ impl AvdtpSourceSession {
     pub fn start_discovery(&mut self) -> AvdtpAction {
         self.state = AvdtpState::Discovering;
         self.media_channel_up = false;
+        self.candidate_count = 0;
+        self.candidate_idx = 0;
+        self.use_legacy_get_caps = false;
+        self.delay_reporting_supported = false;
+        self.reasm_len = 0;
         self.make_cmd(AVDTP_DISCOVER, &[])
     }
 
@@ -159,16 +209,95 @@ impl AvdtpSourceSession {
         }
     }
 
-    /// Process an incoming AVDTP signaling PDU from the remote headset.
-    pub fn on_signaling_pdu(&mut self, pdu: &[u8]) -> AvdtpAction {
-        if pdu.len() < 2 {
+    fn query_current_candidate_caps(&mut self) -> AvdtpAction {
+        let idx = usize::from(self.candidate_idx);
+        if idx >= usize::from(self.candidate_count) {
+            self.state = AvdtpState::Failed(0xC2);
             return AvdtpAction::None;
         }
-        let tx_bits = pdu[0] & 0xF0;
-        let msg_type = pdu[0] & 0x03;
-        let sig_id = pdu[1] & 0x3F;
-        let body = &pdu[2..];
+        let seid = self.candidate_seids[idx];
+        self.acp_seid = seid;
+        self.state = AvdtpState::GettingCapabilities;
+        let arg = [seid << 2];
+        let op = if self.use_legacy_get_caps {
+            AVDTP_GET_CAPABILITIES
+        } else {
+            AVDTP_GET_ALL_CAPABILITIES
+        };
+        self.make_cmd(op, &arg)
+    }
 
+    /// Process an incoming AVDTP signaling PDU from the remote headset, including
+    /// AVDTP §8.4 `Start` / `Continue` / `End` multi-packet reassembly.
+    pub fn on_signaling_pdu(&mut self, pdu: &[u8]) -> AvdtpAction {
+        if pdu.is_empty() {
+            return AvdtpAction::None;
+        }
+        let pkt_type = (pdu[0] >> 2) & 0x03;
+        match pkt_type {
+            AVDTP_PKT_SINGLE => {
+                if pdu.len() < 2 {
+                    return AvdtpAction::None;
+                }
+                self.reasm_len = 0;
+                let tx_bits = pdu[0] & 0xF0;
+                let msg_type = pdu[0] & 0x03;
+                let sig_id = pdu[1] & 0x3F;
+                self.dispatch_assembled_pdu(tx_bits, msg_type, sig_id, &pdu[2..])
+            }
+            AVDTP_PKT_START => {
+                if pdu.len() < 3 {
+                    return AvdtpAction::None;
+                }
+                self.reasm_hdr0 = pdu[0];
+                self.reasm_sig_id = pdu[2] & 0x3F;
+                let frag = &pdu[3..];
+                let take = frag.len().min(MAX_REASM_SIG_BYTES);
+                self.reasm_buf[..take].copy_from_slice(&frag[..take]);
+                self.reasm_len = take;
+                AvdtpAction::None
+            }
+            AVDTP_PKT_CONTINUE => {
+                if self.reasm_len == 0 || pdu.len() < 2 {
+                    return AvdtpAction::None;
+                }
+                let frag = &pdu[1..];
+                let space = MAX_REASM_SIG_BYTES.saturating_sub(self.reasm_len);
+                let take = frag.len().min(space);
+                self.reasm_buf[self.reasm_len..self.reasm_len + take]
+                    .copy_from_slice(&frag[..take]);
+                self.reasm_len += take;
+                AvdtpAction::None
+            }
+            AVDTP_PKT_END => {
+                if self.reasm_len == 0 {
+                    return AvdtpAction::None;
+                }
+                let frag = &pdu[1..];
+                let space = MAX_REASM_SIG_BYTES.saturating_sub(self.reasm_len);
+                let take = frag.len().min(space);
+                self.reasm_buf[self.reasm_len..self.reasm_len + take]
+                    .copy_from_slice(&frag[..take]);
+                let total = self.reasm_len + take;
+                self.reasm_len = 0;
+                let tx_bits = self.reasm_hdr0 & 0xF0;
+                let msg_type = self.reasm_hdr0 & 0x03;
+                let sig_id = self.reasm_sig_id;
+                let mut body_copy = [0u8; MAX_REASM_SIG_BYTES];
+                body_copy[..total].copy_from_slice(&self.reasm_buf[..total]);
+                self.dispatch_assembled_pdu(tx_bits, msg_type, sig_id, &body_copy[..total])
+            }
+            _ => AvdtpAction::None,
+        }
+    }
+
+    fn dispatch_assembled_pdu(
+        &mut self,
+        tx_bits: u8,
+        msg_type: u8,
+        sig_id: u8,
+        body: &[u8],
+    ) -> AvdtpAction {
         match msg_type {
             AVDTP_MSG_COMMAND => self.handle_peer_command(tx_bits, sig_id, body),
             AVDTP_MSG_RESPONSE_ACCEPT => self.handle_response_accept(sig_id, body),
@@ -176,9 +305,26 @@ impl AvdtpSourceSession {
                 // Fall back from GET_ALL_CAPABILITIES (`0x0C`) to legacy GET_CAPABILITIES (`0x02`).
                 if sig_id == AVDTP_GET_ALL_CAPABILITIES
                     && self.state == AvdtpState::GettingCapabilities
+                    && !self.use_legacy_get_caps
                 {
-                    let arg = [self.acp_seid << 2];
-                    return self.make_cmd(AVDTP_GET_CAPABILITIES, &arg);
+                    self.use_legacy_get_caps = true;
+                    return self.query_current_candidate_caps();
+                }
+                // If one candidate SEP failed capability query, advance to the next SEP.
+                if sig_id == AVDTP_GET_CAPABILITIES
+                    && self.state == AvdtpState::GettingCapabilities
+                    && usize::from(self.candidate_idx + 1) < usize::from(self.candidate_count)
+                {
+                    self.candidate_idx += 1;
+                    return self.query_current_candidate_caps();
+                }
+                // If SET_CONFIGURATION failed when Delay Reporting was included, retry once without it.
+                if sig_id == AVDTP_SET_CONFIGURATION
+                    && self.state == AvdtpState::SettingConfiguration
+                    && self.delay_reporting_supported
+                {
+                    self.delay_reporting_supported = false;
+                    return self.build_set_configuration_cmd();
                 }
                 let code = body.first().copied().unwrap_or(0xFF);
                 self.state = AvdtpState::Failed(code);
@@ -188,6 +334,28 @@ impl AvdtpSourceSession {
         }
     }
 
+    fn build_set_configuration_cmd(&mut self) -> AvdtpAction {
+        let ie = encode_sbc_codec_ie_with_min(self.negotiated_sbc, self.negotiated_min_bitpool);
+        let mut cfg_payload = [0u8; 16];
+        cfg_payload[0] = self.acp_seid << 2;
+        cfg_payload[1] = LOCAL_SOURCE_SEID << 2;
+        cfg_payload[2] = AVDTP_CAT_MEDIA_TRANSPORT;
+        cfg_payload[3] = 0x00;
+        cfg_payload[4] = AVDTP_CAT_MEDIA_CODEC;
+        cfg_payload[5] = 0x06;
+        cfg_payload[6] = 0x00; // Media Type = Audio
+        cfg_payload[7] = 0x00; // Codec = SBC
+        cfg_payload[8..12].copy_from_slice(&ie);
+        let plen = if self.delay_reporting_supported {
+            cfg_payload[12] = AVDTP_CAT_DELAY_REPORTING;
+            cfg_payload[13] = 0x00;
+            14
+        } else {
+            12
+        };
+        self.make_cmd(AVDTP_SET_CONFIGURATION, &cfg_payload[..plen])
+    }
+
     fn handle_peer_command(&mut self, tx_bits: u8, sig_id: u8, body: &[u8]) -> AvdtpAction {
         let mut buf = [0u8; 32];
         buf[0] = tx_bits | AVDTP_MSG_RESPONSE_ACCEPT;
@@ -195,27 +363,73 @@ impl AvdtpSourceSession {
 
         match sig_id {
             AVDTP_DISCOVER => {
-                // Advertise Local SEID 1: Audio Source (`TSEP = 0`), Audio (`0`).
-                buf[2] = LOCAL_SOURCE_SEID << 2;
+                // Advertise Local SEID 1: Audio Source (`TSEP = 0`), Audio (`0`), in_use if active.
+                let in_use_bit = u8::from(matches!(
+                    self.state,
+                    AvdtpState::Opening
+                        | AvdtpState::WaitingForMediaChannel
+                        | AvdtpState::Starting
+                        | AvdtpState::Streaming
+                        | AvdtpState::Suspended
+                )) << 1;
+                buf[2] = (LOCAL_SOURCE_SEID << 2) | in_use_bit;
                 buf[3] = 0x00;
                 AvdtpAction::SendSignaling { len: 4, buf }
             }
             AVDTP_GET_CAPABILITIES | AVDTP_GET_ALL_CAPABILITIES => {
-                let caps = [
+                let caps = if sig_id == AVDTP_GET_ALL_CAPABILITIES {
+                    &[
+                        AVDTP_CAT_MEDIA_TRANSPORT,
+                        0x00,
+                        AVDTP_CAT_MEDIA_CODEC,
+                        0x06,
+                        0x00,
+                        0x00,
+                        0x3F,
+                        0xFF,
+                        2,
+                        53,
+                        AVDTP_CAT_DELAY_REPORTING,
+                        0x00,
+                    ][..]
+                } else {
+                    &[
+                        AVDTP_CAT_MEDIA_TRANSPORT,
+                        0x00,
+                        AVDTP_CAT_MEDIA_CODEC,
+                        0x06,
+                        0x00,
+                        0x00,
+                        0x3F,
+                        0xFF,
+                        2,
+                        53,
+                    ][..]
+                };
+                buf[2..2 + caps.len()].copy_from_slice(caps);
+                AvdtpAction::SendSignaling {
+                    len: 2 + caps.len(),
+                    buf,
+                }
+            }
+            AVDTP_GET_CONFIGURATION => {
+                let ie =
+                    encode_sbc_codec_ie_with_min(self.negotiated_sbc, self.negotiated_min_bitpool);
+                let rsp = [
                     AVDTP_CAT_MEDIA_TRANSPORT,
                     0x00,
                     AVDTP_CAT_MEDIA_CODEC,
                     0x06,
                     0x00,
                     0x00,
-                    0x3F,
-                    0xFF,
-                    2,
-                    53,
+                    ie[0],
+                    ie[1],
+                    ie[2],
+                    ie[3],
                 ];
-                buf[2..2 + caps.len()].copy_from_slice(&caps);
+                buf[2..2 + rsp.len()].copy_from_slice(&rsp);
                 AvdtpAction::SendSignaling {
-                    len: 2 + caps.len(),
+                    len: 2 + rsp.len(),
                     buf,
                 }
             }
@@ -228,8 +442,19 @@ impl AvdtpSourceSession {
             AVDTP_SET_CONFIGURATION => {
                 if body.len() >= 2 {
                     self.acp_seid = body[1] >> 2;
-                    if let Some(cfg) = select_sbc_from_service_caps(&body[2..]) {
-                        self.negotiated_sbc = cfg;
+                    if let Some(parsed) = parse_sink_service_caps(&body[2..]) {
+                        self.negotiated_sbc = parsed.sbc;
+                        self.negotiated_min_bitpool = parsed.min_bitpool;
+                        self.delay_reporting_supported = parsed.delay_reporting;
+                    }
+                }
+                AvdtpAction::SendSignaling { len: 2, buf }
+            }
+            AVDTP_RECONFIGURE => {
+                if body.len() >= 2 {
+                    if let Some(parsed) = parse_sink_service_caps(&body[1..]) {
+                        self.negotiated_sbc = parsed.sbc;
+                        self.negotiated_min_bitpool = parsed.min_bitpool;
                     }
                 }
                 AvdtpAction::SendSignaling { len: 2, buf }
@@ -262,47 +487,49 @@ impl AvdtpSourceSession {
     fn handle_response_accept(&mut self, sig_id: u8, body: &[u8]) -> AvdtpAction {
         match sig_id {
             AVDTP_DISCOVER => {
-                // Find first available Audio Sink SEP (`TSEP = 1`, `in_use = 0`, `MediaType = 0`).
+                // Collect ALL unused Audio Sink SEPs (`TSEP = 1`, `in_use = 0`, `MediaType = 0`),
+                // because real headphones often put AAC/aptX/LDAC on SEID 1 and SBC on SEID 2+.
+                self.candidate_count = 0;
+                self.candidate_idx = 0;
                 let mut idx = 0usize;
-                let mut found_seid = None;
                 while idx + 1 < body.len() {
                     let seid = body[idx] >> 2;
                     let in_use = (body[idx] & 0x02) != 0;
                     let media_type = body[idx + 1] >> 4;
                     let tsep = (body[idx + 1] >> 3) & 0x01;
-                    if seid != 0 && !in_use && media_type == 0 && tsep == 1 {
-                        found_seid = Some(seid);
-                        break;
+                    if seid != 0
+                        && !in_use
+                        && media_type == 0
+                        && tsep == 1
+                        && usize::from(self.candidate_count) < MAX_CANDIDATE_SEIDS
+                    {
+                        self.candidate_seids[usize::from(self.candidate_count)] = seid;
+                        self.candidate_count += 1;
                     }
                     idx += 2;
                 }
-                let seid = found_seid.unwrap_or(1);
-                self.acp_seid = seid;
-                self.state = AvdtpState::GettingCapabilities;
-                let arg = [seid << 2];
-                self.make_cmd(AVDTP_GET_ALL_CAPABILITIES, &arg)
+                if self.candidate_count == 0 {
+                    self.candidate_seids[0] = 1;
+                    self.candidate_count = 1;
+                }
+                self.query_current_candidate_caps()
             }
             AVDTP_GET_ALL_CAPABILITIES | AVDTP_GET_CAPABILITIES => {
-                if let Some(cfg) = select_sbc_from_service_caps(body) {
-                    self.negotiated_sbc = cfg;
+                if let Some(parsed) = parse_sink_service_caps(body) {
+                    self.negotiated_sbc = parsed.sbc;
+                    self.negotiated_min_bitpool = parsed.min_bitpool;
+                    self.delay_reporting_supported =
+                        sig_id == AVDTP_GET_ALL_CAPABILITIES && parsed.delay_reporting;
+                    self.state = AvdtpState::SettingConfiguration;
+                    self.build_set_configuration_cmd()
+                } else if usize::from(self.candidate_idx + 1) < usize::from(self.candidate_count) {
+                    // Current SEP is non-SBC (e.g. AAC/aptX/LDAC); inspect next Sink SEP!
+                    self.candidate_idx += 1;
+                    self.query_current_candidate_caps()
+                } else {
+                    self.state = AvdtpState::Failed(0xC2);
+                    AvdtpAction::None
                 }
-                self.state = AvdtpState::SettingConfiguration;
-                let ie = encode_sbc_codec_ie(self.negotiated_sbc);
-                let cfg_payload = [
-                    self.acp_seid << 2,
-                    LOCAL_SOURCE_SEID << 2,
-                    AVDTP_CAT_MEDIA_TRANSPORT,
-                    0x00,
-                    AVDTP_CAT_MEDIA_CODEC,
-                    0x06,
-                    0x00, // Media Type = Audio
-                    0x00, // Codec = SBC
-                    ie[0],
-                    ie[1],
-                    ie[2],
-                    ie[3],
-                ];
-                self.make_cmd(AVDTP_SET_CONFIGURATION, &cfg_payload)
             }
             AVDTP_SET_CONFIGURATION => {
                 self.state = AvdtpState::Opening;
@@ -343,10 +570,13 @@ impl Default for AvdtpSourceSession {
     }
 }
 
-/// Select the highest-fidelity SBC configuration supported by the Sink's service capabilities.
+/// Inspect a Sink SEP's Service Capabilities list for Audio SBC (`0x00`) + Delay Reporting (`0x08`).
 #[must_use]
-pub fn select_sbc_from_service_caps(caps: &[u8]) -> Option<SbcConfig> {
+pub fn parse_sink_service_caps(caps: &[u8]) -> Option<ParsedSinkCaps> {
     let mut pos = 0usize;
+    let mut found_sbc: Option<(SbcConfig, u8)> = None;
+    let mut has_delay_report = false;
+
     while pos + 2 <= caps.len() {
         let cat = caps[pos];
         let len = usize::from(caps[pos + 1]);
@@ -354,10 +584,13 @@ pub fn select_sbc_from_service_caps(caps: &[u8]) -> Option<SbcConfig> {
             break;
         }
         let val = &caps[pos + 2..pos + 2 + len];
-        if cat == AVDTP_CAT_MEDIA_CODEC && val.len() >= 6 && val[0] == 0x00 && val[1] == 0x00 {
+        if cat == AVDTP_CAT_DELAY_REPORTING {
+            has_delay_report = true;
+        } else if cat == AVDTP_CAT_MEDIA_CODEC && val.len() >= 6 && val[0] == 0x00 && val[1] == 0x00
+        {
             let b0 = val[2];
             let b1 = val[3];
-            let min_bp = val[4].max(2);
+            let min_bp = val[4].clamp(2, 250);
             let max_bp = val[5].max(min_bp);
 
             let sample_rate = if (b0 & 0x10) != 0 {
@@ -403,23 +636,38 @@ pub fn select_sbc_from_service_caps(caps: &[u8]) -> Option<SbcConfig> {
             };
 
             let bitpool = 53u8.clamp(min_bp, max_bp);
-            return Some(SbcConfig {
-                sample_rate,
-                blocks,
-                channel_mode,
-                alloc_method,
-                subbands,
-                bitpool,
-            });
+            found_sbc = Some((
+                SbcConfig {
+                    sample_rate,
+                    blocks,
+                    channel_mode,
+                    alloc_method,
+                    subbands,
+                    bitpool,
+                },
+                min_bp,
+            ));
         }
         pos += 2 + len;
     }
-    None
+
+    found_sbc.map(|(sbc, min_bitpool)| ParsedSinkCaps {
+        sbc,
+        min_bitpool,
+        delay_reporting: has_delay_report,
+    })
 }
 
-/// Encode 4-byte SBC Codec Specific Information Elements for `AVDTP_SET_CONFIGURATION`.
+/// Select the highest-fidelity SBC configuration supported by the Sink's service capabilities.
 #[must_use]
-pub const fn encode_sbc_codec_ie(cfg: SbcConfig) -> [u8; 4] {
+pub fn select_sbc_from_service_caps(caps: &[u8]) -> Option<SbcConfig> {
+    parse_sink_service_caps(caps).map(|p| p.sbc)
+}
+
+/// Encode 4-byte SBC Codec Specific Information Elements for `AVDTP_SET_CONFIGURATION`,
+/// preserving the Sink's advertised `min_bitpool` (`A2DP 1.3 §4.3.2.6`).
+#[must_use]
+pub const fn encode_sbc_codec_ie_with_min(cfg: SbcConfig, min_bitpool: u8) -> [u8; 4] {
     let freq_bit = match cfg.sample_rate {
         SbcSampleRate::Hz16000 => 0x80,
         SbcSampleRate::Hz32000 => 0x40,
@@ -446,12 +694,25 @@ pub const fn encode_sbc_codec_ie(cfg: SbcConfig) -> [u8; 4] {
         SbcAllocMethod::Snr => 0x02,
         SbcAllocMethod::Loudness => 0x01,
     };
+    let safe_min = if min_bitpool < 2 {
+        2
+    } else if min_bitpool > cfg.bitpool {
+        cfg.bitpool
+    } else {
+        min_bitpool
+    };
     [
         freq_bit | mode_bit,
         blk_bit | sb_bit | alloc_bit,
-        2,
+        safe_min,
         cfg.bitpool,
     ]
+}
+
+/// Encode 4-byte SBC Codec Specific Information Elements for `AVDTP_SET_CONFIGURATION`.
+#[must_use]
+pub const fn encode_sbc_codec_ie(cfg: SbcConfig) -> [u8; 4] {
+    encode_sbc_codec_ie_with_min(cfg, 2)
 }
 
 // ============================================================================
@@ -586,7 +847,7 @@ impl AvrcpSession {
             if opcode == AVRCP_OP_PASS_THROUGH && pdu.len() >= 8 {
                 let raw_op = pdu[6];
                 let released = (raw_op & 0x80) != 0;
-                let btn = AvrcpButton::from_op_id(raw_op);
+                let btn = AvrcpButton::from_op_id(op_id_from(raw_op));
                 out.event = if released {
                     AvrcpEvent::ButtonReleased(btn)
                 } else {
@@ -655,6 +916,10 @@ impl AvrcpSession {
     }
 }
 
+const fn op_id_from(raw: u8) -> u8 {
+    raw
+}
+
 impl Default for AvrcpSession {
     fn default() -> Self {
         Self::new()
@@ -676,18 +941,53 @@ mod tests {
         assert_eq!(len, 2);
         assert_eq!(buf[1], AVDTP_DISCOVER);
 
-        // Simulated Discover Accept (`SEID = 1`, Audio Sink)
-        let act1 = src.on_signaling_pdu(&[(buf[0] & 0xF0) | 0x02, AVDTP_DISCOVER, 1 << 2, 0x08]);
+        // Simulated Discover Accept (`SEID = 1` = AAC Sink, `SEID = 3` = SBC Sink)
+        let act1 = src.on_signaling_pdu(&[
+            (buf[0] & 0xF0) | 0x02,
+            AVDTP_DISCOVER,
+            1 << 2,
+            0x08,
+            3 << 2,
+            0x08,
+        ]);
         let AvdtpAction::SendSignaling { len: l1, buf: b1 } = act1 else {
             assert_eq!(act1, AvdtpAction::StreamClosed);
             return;
         };
         assert_eq!(l1, 3);
         assert_eq!(b1[1], AVDTP_GET_ALL_CAPABILITIES);
+        assert_eq!(b1[2], 1 << 2);
 
-        // Simulated GetAllCapabilities Accept (`48k|44.1k`, `JS`, `16 blk`, `8 sb`, `2..53`)
-        let caps_rsp = [
+        // SEID 1 returns AAC (`CodecType = 0x02`) -> session must automatically advance to SEID 3!
+        let aac_rsp = [
             (b1[0] & 0xF0) | 0x02,
+            AVDTP_GET_ALL_CAPABILITIES,
+            0x01,
+            0x00,
+            0x07,
+            0x08,
+            0x00,
+            0x02,
+            0x80,
+            0x01,
+            0x8C,
+            0x83,
+            0xE8,
+            0x00,
+        ];
+        let act1b = src.on_signaling_pdu(&aac_rsp);
+        let AvdtpAction::SendSignaling { len: l1b, buf: b1b } = act1b else {
+            assert_eq!(act1b, AvdtpAction::StreamClosed);
+            return;
+        };
+        assert_eq!(l1b, 3);
+        assert_eq!(b1b[1], AVDTP_GET_ALL_CAPABILITIES);
+        assert_eq!(b1b[2], 3 << 2);
+
+        // SEID 3 returns fragmented Start + End GetAllCapabilities with SBC (`min_bp=18..53`) + DelayReporting
+        let start_pkt = [
+            (b1b[0] & 0xF0) | (AVDTP_PKT_START << 2) | 0x02,
+            2, // 2 fragments
             AVDTP_GET_ALL_CAPABILITIES,
             0x01,
             0x00,
@@ -695,17 +995,29 @@ mod tests {
             0x06,
             0x00,
             0x00,
+        ];
+        assert_eq!(src.on_signaling_pdu(&start_pkt), AvdtpAction::None);
+        let end_pkt = [
+            (b1b[0] & 0xF0) | (AVDTP_PKT_END << 2) | 0x02,
             0x3F,
             0xFF,
-            2,
+            18,
             53,
+            AVDTP_CAT_DELAY_REPORTING,
+            0x00,
         ];
-        let act2 = src.on_signaling_pdu(&caps_rsp);
-        let AvdtpAction::SendSignaling { buf: b2, .. } = act2 else {
+        let act2 = src.on_signaling_pdu(&end_pkt);
+        let AvdtpAction::SendSignaling { len: l2, buf: b2 } = act2 else {
             assert_eq!(act2, AvdtpAction::StreamClosed);
             return;
         };
         assert_eq!(b2[1], AVDTP_SET_CONFIGURATION);
+        assert_eq!(b2[2], 3 << 2);
+        // Sink `min_bitpool = 18` and `DelayReporting (0x08)` must be preserved!
+        assert_eq!(b2[12], 18);
+        assert_eq!(b2[13], 53);
+        assert_eq!(l2, 16);
+        assert_eq!(b2[14], AVDTP_CAT_DELAY_REPORTING);
 
         let act3 = src.on_signaling_pdu(&[(b2[0] & 0xF0) | 0x02, AVDTP_SET_CONFIGURATION]);
         let AvdtpAction::SendSignaling { buf: b3, .. } = act3 else {

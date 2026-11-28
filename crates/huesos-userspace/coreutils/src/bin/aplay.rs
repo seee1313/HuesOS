@@ -24,7 +24,7 @@ cu::coreutil_entry!(run);
 
 fn print_usage() {
     cu::outln(
-        "usage: aplay <file.wav> | aplay --raw [-r <rate>] [-c <1|2>] <file.pcm|-> | aplay --synth [hz] [ms] | aplay --gen-wav <out.wav> [hz] [ms]",
+        "usage: aplay <file.wav> | aplay --raw [-r <rate>] [-c <1|2>] <file.pcm|-> | aplay --synth|--tone [hz] [ms] | aplay --gen-wav <out.wav> [hz] [ms]",
     );
 }
 
@@ -141,7 +141,7 @@ fn run() -> i32 {
         }
     }
 
-    if args[0] == "--synth" {
+    if matches!(args[0].as_str(), "--synth" | "--tone" | "synth" | "tone") {
         let freq = args
             .get(1)
             .and_then(|s| s.parse::<u16>().ok())
@@ -149,7 +149,7 @@ fn run() -> i32 {
         let ms = args
             .get(2)
             .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(150);
+            .unwrap_or(1_000);
         let samples = synth_stereo_chord(48_000, freq, ms);
         let mut stream = match audio::open_stream(48_000, 2) {
             Ok(s) => s,
@@ -162,7 +162,7 @@ fn run() -> i32 {
             cu::errln(&format!("aplay: stream write failed: {e}"));
             return 1;
         }
-        stream.drain(2500);
+        stream.drain(u32::from(ms).saturating_add(2_500));
         cu::outln(&format!(
             "aplay: streamed {} stereo frames ({freq}Hz/{ms}ms) on HARB stream #{}",
             samples.len() / 2,

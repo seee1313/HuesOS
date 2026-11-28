@@ -45,7 +45,9 @@ mod tests {
         AclCreditTracker, AclReassembler, BdAddr, BtUsbAclReassembler, BtUsbEvtReassembler,
         DecodedHciEvent, EVT_INQUIRY_RESULT_RSSI, H4_CMD, H4_EVT,
     };
-    use super::l2cap::{wrap_l2cap_pdu, L2capEngine, L2capEvent, PSM_AVDTP, PSM_SDP};
+    use super::l2cap::{
+        wrap_l2cap_pdu, L2capChanState, L2capEngine, L2capEvent, CID_SIGNALING, PSM_AVDTP, PSM_SDP,
+    };
     use super::sdp::{
         build_query_audio_sink_req, handle_sdp_request, parse_audio_sink_response,
         SDP_SVC_SEARCH_ATTR_REQ, UUID_AUDIO_SOURCE,
@@ -443,5 +445,78 @@ mod tests {
             }
         }
         assert!(sdp_sink_ok);
+    }
+
+    #[test]
+    fn l2cap_handles_config_pending_and_mtu_fallback() {
+        let mut l2 = L2capEngine::new();
+        let cid = l2.connect(0x0040, VIRTUAL_HEADSET_ADDR, PSM_AVDTP);
+        let tx0 = l2.drain_outbound();
+        assert_eq!(tx0.len(), 1);
+
+        // Peer replies ConnRsp Pending (`result = 0x0001`), then ConnRsp Success (`remote_cid = 0x0055`)
+        l2.on_reassembled_pdu(
+            0x0040,
+            VIRTUAL_HEADSET_ADDR,
+            CID_SIGNALING,
+            &[
+                0x03, 0x01, 0x08, 0x00, 0x55, 0x00, 0x40, 0x00, 0x01, 0x00, 0x02, 0x00,
+            ],
+        );
+        assert!(l2.drain_outbound().is_empty());
+
+        l2.on_reassembled_pdu(
+            0x0040,
+            VIRTUAL_HEADSET_ADDR,
+            CID_SIGNALING,
+            &[
+                0x03, 0x01, 0x08, 0x00, 0x55, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
+        );
+        let cfg_tx = l2.drain_outbound();
+        assert_eq!(cfg_tx.len(), 1); // Initial ConfigReq (MTU 896)
+
+        // Peer replies ConfigRsp Pending (`result = 0x0004`), then Unacceptable Params (`0x0001`, MTU 672)
+        l2.on_reassembled_pdu(
+            0x0040,
+            VIRTUAL_HEADSET_ADDR,
+            CID_SIGNALING,
+            &[0x05, 0x02, 0x06, 0x00, 0x40, 0x00, 0x00, 0x00, 0x04, 0x00],
+        );
+        assert!(l2.drain_events().is_empty());
+
+        l2.on_reassembled_pdu(
+            0x0040,
+            VIRTUAL_HEADSET_ADDR,
+            CID_SIGNALING,
+            &[
+                0x05, 0x02, 0x0A, 0x00, 0x40, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x02, 0xA0, 0x02,
+            ],
+        );
+        let retry_tx = l2.drain_outbound();
+        assert_eq!(retry_tx.len(), 1); // Retried ConfigReq with MTU 672 (`0x02A0`)
+        assert_eq!(&retry_tx[0].pdu[14..16], &672u16.to_le_bytes());
+
+        // Peer accepts retried ConfigReq and sends its own ConfigReq (MTU 895)
+        l2.on_reassembled_pdu(
+            0x0040,
+            VIRTUAL_HEADSET_ADDR,
+            CID_SIGNALING,
+            &[0x05, 0x03, 0x06, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00],
+        );
+        l2.on_reassembled_pdu(
+            0x0040,
+            VIRTUAL_HEADSET_ADDR,
+            CID_SIGNALING,
+            &[
+                0x04, 0x09, 0x08, 0x00, 0x40, 0x00, 0x00, 0x00, 0x01, 0x02, 0x7F, 0x03,
+            ],
+        );
+        let Some(ch) = l2.channel(cid) else {
+            assert!(false);
+            return;
+        };
+        assert_eq!(ch.state, L2capChanState::Open);
+        assert_eq!(ch.remote_mtu, 895);
     }
 }

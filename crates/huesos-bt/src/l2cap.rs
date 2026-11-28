@@ -170,11 +170,11 @@ fn build_config_req(ident: u8, dst_cid: u16, local_mtu: u16) -> Vec<u8> {
     wrap_sig_cmd(SIG_CONFIG_REQ, ident, &data)
 }
 
-fn build_config_rsp_ok(ident: u8, src_cid: u16) -> Vec<u8> {
-    // [src_cid(2), flags=0(2), result=0x0000(Success)(2)]
+fn build_config_rsp_ok(ident: u8, src_cid: u16, flags: u16) -> Vec<u8> {
+    // [src_cid(2), flags(2), result=0x0000(Success)(2)]
     let mut data = [0u8; 6];
     data[0..2].copy_from_slice(&src_cid.to_le_bytes());
-    data[2..4].copy_from_slice(&0u16.to_le_bytes());
+    data[2..4].copy_from_slice(&(flags & 0x0001).to_le_bytes());
     data[4..6].copy_from_slice(&0u16.to_le_bytes());
     wrap_sig_cmd(SIG_CONFIG_RSP, ident, &data)
 }
@@ -527,6 +527,7 @@ impl L2capEngine {
                 }
                 SIG_CONFIG_REQ if data.len() >= 4 => {
                     let dst_cid = u16::from_le_bytes([data[0], data[1]]);
+                    let req_flags = u16::from_le_bytes([data[2], data[3]]);
                     let opts = &data[4..];
                     let mut parsed_mtu: Option<u16> = None;
                     let mut opos = 0usize;
@@ -556,31 +557,39 @@ impl L2capEngine {
                         let remote_cid = ch.remote_cid;
                         self.tx_queue.push(OutboundL2capPdu {
                             conn_handle,
-                            pdu: build_config_rsp_ok(ident, remote_cid),
+                            pdu: build_config_rsp_ok(ident, remote_cid, req_flags),
                         });
-                        if let L2capChanState::Config {
-                            local_cfg_done,
-                            ref mut remote_cfg_done,
-                        } = ch.state
-                        {
-                            *remote_cfg_done = true;
-                            if local_cfg_done {
-                                ch.state = L2capChanState::Open;
-                                self.events.push(L2capEvent::ChannelOpened {
-                                    local_cid: ch.local_cid,
-                                    conn_handle: ch.conn_handle,
-                                    peer_addr: ch.peer_addr,
-                                    psm: ch.psm,
-                                    initiator: ch.initiator,
-                                    remote_mtu: ch.remote_mtu,
-                                });
+                        if (req_flags & 0x0001) == 0 {
+                            if let L2capChanState::Config {
+                                local_cfg_done,
+                                ref mut remote_cfg_done,
+                            } = ch.state
+                            {
+                                *remote_cfg_done = true;
+                                if local_cfg_done {
+                                    ch.state = L2capChanState::Open;
+                                    self.events.push(L2capEvent::ChannelOpened {
+                                        local_cid: ch.local_cid,
+                                        conn_handle: ch.conn_handle,
+                                        peer_addr: ch.peer_addr,
+                                        psm: ch.psm,
+                                        initiator: ch.initiator,
+                                        remote_mtu: ch.remote_mtu,
+                                    });
+                                }
                             }
                         }
                     }
                 }
                 SIG_CONFIG_RSP if data.len() >= 6 => {
                     let src_cid = u16::from_le_bytes([data[0], data[1]]);
+                    let rsp_flags = u16::from_le_bytes([data[2], data[3]]);
                     let result = u16::from_le_bytes([data[4], data[5]]);
+                    if result == 0x0004 || (rsp_flags & 0x0001) != 0 {
+                        // Pending (`0x0004`) or continuation (`C = 1`): await final ConfigRsp.
+                        continue;
+                    }
+                    let retry_ident = self.alloc_ident();
                     if let Some(ch) = self
                         .channels
                         .iter_mut()
@@ -605,6 +614,20 @@ impl L2capEngine {
                                     });
                                 }
                             }
+                        } else if result == 0x0001 && ch.local_mtu != BASELINE_REMOTE_MTU {
+                            // Peer rejected our proposed local RX MTU; adopt suggested MTU or 672.
+                            let mut fallback_mtu = BASELINE_REMOTE_MTU;
+                            let opts = &data[6..];
+                            if opts.len() >= 4 && (opts[0] & 0x7F) == 0x01 && opts[1] == 2 {
+                                fallback_mtu =
+                                    u16::from_le_bytes([opts[2], opts[3]]).clamp(48, 1017);
+                            }
+                            ch.local_mtu = fallback_mtu;
+                            let remote_cid = ch.remote_cid;
+                            self.tx_queue.push(OutboundL2capPdu {
+                                conn_handle,
+                                pdu: build_config_req(retry_ident, remote_cid, fallback_mtu),
+                            });
                         } else {
                             let psm = ch.psm;
                             ch.state = L2capChanState::Closed;
