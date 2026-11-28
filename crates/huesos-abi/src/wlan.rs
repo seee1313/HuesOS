@@ -44,6 +44,8 @@ pub enum WlanOp {
     SetRegDomain = 9,
     /// Enable or disable saved-profile autoconnect.
     SetAutoconnect = 10,
+    /// Coordinate shared 2.4 GHz `RTL8821CE` PTA/TDMA coexistence with `btl-service`.
+    SetBtCoexProfile = 11,
 }
 
 impl WlanOp {
@@ -60,6 +62,7 @@ impl WlanOp {
             8 => Self::SetMacPolicy,
             9 => Self::SetRegDomain,
             10 => Self::SetAutoconnect,
+            11 => Self::SetBtCoexProfile,
             _ => return None,
         })
     }
@@ -67,6 +70,45 @@ impl WlanOp {
     /// True when `caps_mask::WLAN_ADMIN` (`wlan=admin`) is required.
     pub const fn requires_admin(self) -> bool {
         !matches!(self, Self::Status | Self::ListProfiles)
+    }
+}
+
+/// Shared 2.4 GHz Wi-Fi / Bluetooth PTA coexistence profile sent from `btl-service`
+/// to `wlan-service` on combo chips such as Realtek `RTL8821CE`.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BtCoexProfile {
+    /// Bluetooth radio is off (`Wi-Fi` owns 100% of shared 2.4 GHz antenna time).
+    #[default]
+    Off = 0,
+    /// Bluetooth radio is initialized and idle/page-scan only.
+    BtIdle = 1,
+    /// Bluetooth Inquiry or SSP pairing is in progress (high-priority BT PTA slots).
+    BtInquiryPair = 2,
+    /// Isochronous-like A2DP SBC audio streaming is active (balanced TDMA antenna sharing).
+    BtA2dpStreaming = 3,
+}
+
+impl BtCoexProfile {
+    /// Decode from wire byte.
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        Some(match raw {
+            0 => Self::Off,
+            1 => Self::BtIdle,
+            2 => Self::BtInquiryPair,
+            3 => Self::BtA2dpStreaming,
+            _ => return None,
+        })
+    }
+
+    /// Short human-readable label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::BtIdle => "bt-idle",
+            Self::BtInquiryPair => "bt-inquiry",
+            Self::BtA2dpStreaming => "bt-a2dp",
+        }
     }
 }
 

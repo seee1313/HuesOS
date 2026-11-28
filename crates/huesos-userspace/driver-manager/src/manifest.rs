@@ -308,6 +308,18 @@ pub const BLOCK_USB_SERVICE: ServiceManifest = ServiceManifest {
     required: false,
 };
 
+/// USB Wireless Bluetooth HCI bridge service manifest.
+pub const USB_BT_SERVICE: ServiceManifest = ServiceManifest {
+    name: "bt:usb",
+    required: false,
+};
+
+/// VirtIO-Sound PCIe playback service manifest.
+pub const AUDIO_SND_SERVICE: ServiceManifest = ServiceManifest {
+    name: "audio:snd",
+    required: false,
+};
+
 /// Input DriverHost manifest.
 ///
 /// 8042 port ownership split (kept in sync with the BOOTFS-embedded
@@ -351,7 +363,17 @@ pub const NVME_HOST: DriverHostManifest = DriverHostManifest {
 /// xHCI USB 3.x DriverHost manifest shell.
 pub const XHCI_HOST: DriverHostManifest = DriverHostManifest {
     name: "driver-host-xhci",
-    services: &[USB_HID_SERVICE, BLOCK_USB_SERVICE],
+    services: &[USB_HID_SERVICE, BLOCK_USB_SERVICE, USB_BT_SERVICE],
+    irqs: &[],
+    io_ports: &[],
+    resources: &[],
+    critical: false,
+};
+
+/// VirtIO-Sound 1.2 PCIe DriverHost manifest shell.
+pub const SND_HOST: DriverHostManifest = DriverHostManifest {
+    name: "driver-host-snd",
+    services: &[AUDIO_SND_SERVICE],
     irqs: &[],
     io_ports: &[],
     resources: &[],
@@ -359,4 +381,4 @@ pub const XHCI_HOST: DriverHostManifest = DriverHostManifest {
 };
 
 /// Static DriverHost manifest table.
-pub const DRIVER_HOSTS: &[DriverHostManifest] = &[INPUT_HOST, NVME_HOST, XHCI_HOST];
+pub const DRIVER_HOSTS: &[DriverHostManifest] = &[INPUT_HOST, NVME_HOST, XHCI_HOST, SND_HOST];

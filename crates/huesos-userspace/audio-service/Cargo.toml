@@ -1,0 +1,27 @@
+[package]
+name = "huesos-audio-service"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "huesos-audio-service"
+path = "src/main.rs"
+
+[features]
+default = []
+boot-selftest = []
+
+[dependencies]
+libcanvas = { path = "../libcanvas" }
+huesos-abi = { path = "../../huesos-abi" }
+huesos-audio = { path = "../../huesos-audio" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

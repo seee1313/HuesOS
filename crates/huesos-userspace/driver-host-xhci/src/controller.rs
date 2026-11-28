@@ -9,17 +9,19 @@ use core::task::{Context, Poll};
 use hues_async::block_on;
 use huesos_abi::usb::{
     self, UsbDeviceRole, UsbInventoryDevice, UsbInventoryHeader, UsbSpeedAbi, MAX_MANUFACTURER_LEN,
-    MAX_PRODUCT_LEN, USB_FLAG_BIOS_HANDOFF_DONE, USB_FLAG_IOMMU_ISOLATED, USB_FLAG_MSI_ACTIVE,
+    MAX_PRODUCT_LEN, USB_FLAG_BIOS_HANDOFF_DONE, USB_FLAG_BT_HCI_ONLINE, USB_FLAG_IOMMU_ISOLATED,
+    USB_FLAG_MSI_ACTIVE,
 };
 use huesos_usb::async_io::{TrbCompletionTable, TrbOutcome, TrbWaitFuture, WaitTicket};
 use huesos_usb::bot::{
     CommandBlockWrapper, CommandStatusWrapper, CswStatus, ScsiCapacity, CBW_BYTES, CSW_BYTES,
 };
 use huesos_usb::ch9::{
-    decode_usb_string_ascii, ConfigurationDescriptor, DescriptorIter, DeviceDescriptor,
-    EndpointDescriptor, ParsedDescriptor, SetupPacket, DESC_CONFIGURATION, DESC_DEVICE,
-    DESC_STRING, HID_PROTO_KEYBOARD, HID_PROTO_MOUSE, MSC_PROTO_BULK_ONLY, MSC_SUBCLASS_SCSI,
-    USB_CLASS_HID, USB_CLASS_HUB, USB_CLASS_MASS_STORAGE,
+    decode_usb_string_ascii, is_bluetooth_hci_interface, is_realtek_rtl8821c_bt,
+    ConfigurationDescriptor, DescriptorIter, DeviceDescriptor, EndpointDescriptor,
+    ParsedDescriptor, SetupPacket, DESC_CONFIGURATION, DESC_DEVICE, DESC_STRING,
+    HID_PROTO_KEYBOARD, HID_PROTO_MOUSE, MSC_PROTO_BULK_ONLY, MSC_SUBCLASS_SCSI, USB_CLASS_HID,
+    USB_CLASS_HUB, USB_CLASS_MASS_STORAGE,
 };
 use huesos_usb::hid::{HidBootKeyboard, HidKeyEvent, HidMouseEvent, MAX_HID_KEY_EVENTS};
 use huesos_usb::hub::{
@@ -55,6 +57,15 @@ const XFER_RING_BASE_OFF: usize = 0x0006_5000; // 64 * 4 KiB = 0x40000
 const SLOT_BUF_BASE_OFF: usize = 0x000A_5000; // 32 * 4 KiB = 0x20000
 pub const BOT_DATA_OFF: usize = 0x0010_0000; // 1 MiB contiguous BOT data window
 pub const BOT_DATA_MAX_BYTES: usize = 0x0004_0000; // 256 KiB MDTS per request
+const BT_CMD_OUT_OFF: usize = 0x0020_0000; // 1 KiB HCI Control OUT buffer
+const BT_ACL_OUT_OFF: usize = 0x0020_0400; // 1 KiB HCI Bulk OUT ACL buffer
+const BT_EVT_IN_OFF: usize = 0x0020_0800; // 1 KiB HCI Interrupt IN Event buffer
+const BT_ACL_IN_OFF: usize = 0x0020_0C00; // 2 KiB HCI Bulk IN ACL buffer
+const BT_RX_FIFO_OFF: usize = 0x0021_0000; // 32 * 1056 B H4 RX ring in DMA pool
+const BT_RX_FIFO_SLOTS: usize = 32;
+const BT_RX_SLOT_STRIDE: usize = 1056;
+const BT_EVT_XFER_LEN: u16 = 260;
+const BT_ACL_XFER_LEN: u16 = 1028;
 
 const SLOT_CTRL_BUF_OFF: usize = 0x000; // 2048 B Control / Descriptor / CBW+CSW
 const SLOT_INTR0_BUF_OFF: usize = 0x800; // 256 B Interrupt IN #0 (Kbd / Hub)
@@ -186,6 +197,38 @@ impl BotPipeState {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct BtHciPipeState {
+    pub active: bool,
+    pub is_realtek: bool,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub evt_in_dci: u8,
+    pub evt_in_ring: u8,
+    pub acl_in_dci: u8,
+    pub acl_in_ring: u8,
+    pub acl_out_ep_addr: u8,
+    pub acl_out_dci: u8,
+    pub acl_out_ring: u8,
+}
+
+impl BtHciPipeState {
+    const EMPTY: Self = Self {
+        active: false,
+        is_realtek: false,
+        vendor_id: 0,
+        product_id: 0,
+        evt_in_dci: 0,
+        evt_in_ring: 0,
+        acl_in_dci: 0,
+        acl_in_ring: 0,
+        acl_out_ep_addr: 0,
+        acl_out_dci: 0,
+        acl_out_ring: 0,
+    };
+}
+
+#[derive(Clone, Copy)]
 struct DeviceSlot {
     active: bool,
     slot_id: u8,
@@ -207,6 +250,7 @@ struct DeviceSlot {
     hub_is_ss: bool,
     hub_child_slots: [u8; 16],
     bot: BotPipeState,
+    bt: BtHciPipeState,
     inv: UsbInventoryDevice,
 }
 
@@ -232,6 +276,7 @@ impl DeviceSlot {
         hub_is_ss: false,
         hub_child_slots: [0; 16],
         bot: BotPipeState::EMPTY,
+        bt: BtHciPipeState::EMPTY,
         inv: UsbInventoryDevice::ZERO,
     };
 }
@@ -249,6 +294,10 @@ struct HwState {
     hid_events: u64,
     bot_blocks_io: u64,
     generation: u64,
+    bt_rx_lens: [u16; BT_RX_FIFO_SLOTS],
+    bt_rx_head: u8,
+    bt_rx_tail: u8,
+    bt_rx_count: u8,
 }
 
 /// Zero-heap asynchronous xHCI 1.x controller instance.
@@ -421,6 +470,10 @@ impl XhciController {
                 hid_events: 0,
                 bot_blocks_io: 0,
                 generation: 1,
+                bt_rx_lens: [0; BT_RX_FIFO_SLOTS],
+                bt_rx_head: 0,
+                bt_rx_tail: 0,
+                bt_rx_count: 0,
             }),
             inventory_dirty: Cell::new(true),
         });
@@ -491,6 +544,18 @@ impl XhciController {
         }
         if self.bios_handoff_done {
             flags |= USB_FLAG_BIOS_HANDOFF_DONE;
+        }
+        let mut bt_slot_online = false;
+        let mut b_idx = 0usize;
+        while b_idx < MAX_SLOTS {
+            if hw.devices[b_idx].active && hw.devices[b_idx].bt.active {
+                bt_slot_online = true;
+                break;
+            }
+            b_idx += 1;
+        }
+        if bt_slot_online {
+            flags |= USB_FLAG_BT_HCI_ONLINE;
         }
         let hdr = UsbInventoryHeader {
             generation: hw.generation,
@@ -568,7 +633,9 @@ impl XhciController {
                     slot_id,
                 } => {
                     self.hw.borrow_mut().completed_trbs += 1;
-                    if !self.try_handle_periodic_intr(slot_id, dci, code, residual_len, sink) {
+                    if !self.try_handle_periodic_intr(slot_id, dci, code, residual_len, sink)
+                        && !self.try_handle_bt_async_rx(slot_id, dci, code, residual_len)
+                    {
                         let _ = self.completions.complete_by_trb(
                             trb_iova,
                             TrbOutcome {
@@ -756,6 +823,162 @@ impl XhciController {
                 let _ = self.pump_events(sink);
             }
         })
+    }
+
+    pub fn first_bt_hci_info(&self) -> Option<(u8, u16, u16, bool)> {
+        let hw = self.hw.borrow();
+        let mut i = 0usize;
+        while i < MAX_SLOTS {
+            let dev = &hw.devices[i];
+            if dev.active && dev.bt.active {
+                return Some((
+                    dev.slot_id,
+                    dev.bt.vendor_id,
+                    dev.bt.product_id,
+                    dev.bt.is_realtek,
+                ));
+            }
+            i += 1;
+        }
+        None
+    }
+
+    pub fn bt_rx_queued(&self) -> u16 {
+        u16::from(self.hw.borrow().bt_rx_count)
+    }
+
+    pub fn bt_pop_rx(&self, dst: &mut [u8]) -> Option<usize> {
+        let (slot_idx, pkt_len) = {
+            let mut hw = self.hw.borrow_mut();
+            if hw.bt_rx_count == 0 {
+                return None;
+            }
+            let head = usize::from(hw.bt_rx_head) % BT_RX_FIFO_SLOTS;
+            let len = usize::from(hw.bt_rx_lens[head])
+                .min(dst.len())
+                .min(BT_RX_SLOT_STRIDE);
+            hw.bt_rx_head = ((head + 1) % BT_RX_FIFO_SLOTS) as u8;
+            hw.bt_rx_count = hw.bt_rx_count.saturating_sub(1);
+            (head, len)
+        };
+        if pkt_len > 0 {
+            self.dma.copy_out(
+                BT_RX_FIFO_OFF + slot_idx * BT_RX_SLOT_STRIDE,
+                &mut dst[..pkt_len],
+            );
+        }
+        Some(pkt_len)
+    }
+
+    pub fn execute_bt_hci_cmd<F>(
+        &self,
+        slot_id: u8,
+        cmd: &[u8],
+        sink: &mut dyn InputEventSink,
+        mut wait_irq: F,
+    ) -> Result<(), UsbError>
+    where
+        F: FnMut(),
+    {
+        block_on(self.bt_send_cmd_async(slot_id, cmd), || {
+            if self.pump_events(sink) == 0 {
+                wait_irq();
+                let _ = self.pump_events(sink);
+            }
+        })
+    }
+
+    pub fn execute_bt_hci_acl<F>(
+        &self,
+        slot_id: u8,
+        acl: &[u8],
+        sink: &mut dyn InputEventSink,
+        mut wait_irq: F,
+    ) -> Result<(), UsbError>
+    where
+        F: FnMut(),
+    {
+        block_on(self.bt_send_acl_async(slot_id, acl), || {
+            if self.pump_events(sink) == 0 {
+                wait_irq();
+                let _ = self.pump_events(sink);
+            }
+        })
+    }
+
+    fn try_handle_bt_async_rx(
+        &self,
+        slot_id: u8,
+        dci: u8,
+        code: CompletionCode,
+        residual: u32,
+    ) -> bool {
+        if slot_id == 0 || usize::from(slot_id) > MAX_SLOTS {
+            return false;
+        }
+        let d_idx = usize::from(slot_id - 1);
+        let (is_evt, ring_idx, src_off, xfer_len) = {
+            let hw = self.hw.borrow();
+            let dev = &hw.devices[d_idx];
+            if !dev.active || !dev.bt.active {
+                return false;
+            }
+            if dci == dev.bt.evt_in_dci {
+                (true, dev.bt.evt_in_ring, BT_EVT_IN_OFF, BT_EVT_XFER_LEN)
+            } else if dci == dev.bt.acl_in_dci {
+                (false, dev.bt.acl_in_ring, BT_ACL_IN_OFF, BT_ACL_XFER_LEN)
+            } else {
+                return false;
+            }
+        };
+
+        if code.is_ok() {
+            let actual = usize::from(xfer_len)
+                .saturating_sub(residual as usize)
+                .min(BT_RX_SLOT_STRIDE - 1);
+            if actual > 0 {
+                let mut raw = [0u8; BT_RX_SLOT_STRIDE - 1];
+                self.dma.copy_out(src_off, &mut raw[..actual]);
+                let push_slot = {
+                    let mut hw = self.hw.borrow_mut();
+                    if usize::from(hw.bt_rx_count) < BT_RX_FIFO_SLOTS {
+                        let tail = usize::from(hw.bt_rx_tail) % BT_RX_FIFO_SLOTS;
+                        hw.bt_rx_lens[tail] = (1 + actual) as u16;
+                        hw.bt_rx_tail = ((tail + 1) % BT_RX_FIFO_SLOTS) as u8;
+                        hw.bt_rx_count += 1;
+                        Some(tail)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(tail) = push_slot {
+                    let dst_off = BT_RX_FIFO_OFF + tail * BT_RX_SLOT_STRIDE;
+                    let h4_tag = [if is_evt { 0x04u8 } else { 0x02u8 }];
+                    self.dma.copy_in(dst_off, &h4_tag);
+                    self.dma.copy_in(dst_off + 1, &raw[..actual]);
+                }
+            }
+        }
+
+        self.arm_bt_rx_pipe(slot_id, dci, ring_idx, src_off, xfer_len);
+        true
+    }
+
+    fn arm_bt_rx_pipe(&self, slot_id: u8, dci: u8, ring_idx: u8, buf_off: usize, xfer_len: u16) {
+        let mut hw = self.hw.borrow_mut();
+        let d_idx = usize::from(slot_id.saturating_sub(1));
+        if d_idx >= MAX_SLOTS || !hw.devices[d_idx].active || !hw.devices[d_idx].bt.active {
+            return;
+        }
+        let r_idx = usize::from(ring_idx);
+        if r_idx >= MAX_XFER_RINGS || !hw.xfer_rings[r_idx].in_use {
+            return;
+        }
+        let buf_phys = self.dma_phys + buf_off as u64;
+        let trb = Trb::xfer_normal(buf_phys, u32::from(xfer_len), true, true, false);
+        let _ = enqueue_xfer_trb(&self.dma, &mut hw.xfer_rings[r_idx], r_idx, trb);
+        drop(hw);
+        self.ring_doorbell(slot_id, dci);
     }
 
     async fn process_topology_async(&self) {
@@ -1190,6 +1413,9 @@ impl XhciController {
         let mut bot_iface: Option<u8> = None;
         let mut bot_in: Option<(EndpointDescriptor, u8)> = None;
         let mut bot_out: Option<(EndpointDescriptor, u8)> = None;
+        let mut bt_evt_ep: Option<(EndpointDescriptor, u8)> = None;
+        let mut bt_acl_in: Option<(EndpointDescriptor, u8)> = None;
+        let mut bt_acl_out: Option<(EndpointDescriptor, u8)> = None;
         let mut total_eps = 0u8;
 
         let iter = DescriptorIter::new(cfg_blob);
@@ -1250,6 +1476,29 @@ impl XhciController {
                             }
                             _ => {}
                         }
+                    } else if is_bluetooth_hci_interface(
+                        dev_desc.vendor_id,
+                        dev_desc.product_id,
+                        iface.interface_number,
+                        iface.interface_class,
+                        iface.interface_subclass,
+                        iface.interface_protocol,
+                    ) {
+                        match ep.xhci_ep_type() {
+                            Some(XhciEndpointType::InterruptIn) if bt_evt_ep.is_none() => {
+                                bt_evt_ep = Some((ep, 0));
+                                last_target = 6;
+                            }
+                            Some(XhciEndpointType::BulkIn) if bt_acl_in.is_none() => {
+                                bt_acl_in = Some((ep, 0));
+                                last_target = 7;
+                            }
+                            Some(XhciEndpointType::BulkOut) if bt_acl_out.is_none() => {
+                                bt_acl_out = Some((ep, 0));
+                                last_target = 8;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 ParsedDescriptor::SsCompanion { max_burst } => match last_target {
@@ -1276,6 +1525,21 @@ impl XhciController {
                     5 => {
                         if let Some(bo) = bot_out.as_mut() {
                             bo.1 = max_burst;
+                        }
+                    }
+                    6 => {
+                        if let Some(be) = bt_evt_ep.as_mut() {
+                            be.1 = max_burst;
+                        }
+                    }
+                    7 => {
+                        if let Some(bai) = bt_acl_in.as_mut() {
+                            bai.1 = max_burst;
+                        }
+                    }
+                    8 => {
+                        if let Some(bao) = bt_acl_out.as_mut() {
+                            bao.1 = max_burst;
                         }
                     }
                     _ => {}
@@ -1322,6 +1586,7 @@ impl XhciController {
         let mut intr0_pipe = IntrPipe::EMPTY;
         let mut intr1_pipe = IntrPipe::EMPTY;
         let mut bot_state = BotPipeState::EMPTY;
+        let mut bt_state = BtHciPipeState::EMPTY;
 
         if let (Some((ep, burst)), Some(_hub_desc)) = (hub_ep, hub_desc_opt) {
             if let Some((dci, r_idx)) = self.prepare_ep_ctx(
@@ -1426,6 +1691,61 @@ impl XhciController {
             }
         }
 
+        if let (Some((ep_evt, b_evt)), Some((ep_ain, b_ain)), Some((ep_aout, b_aout))) =
+            (bt_evt_ep, bt_acl_in, bt_acl_out)
+        {
+            let evt_prep = self.prepare_ep_ctx(
+                slot_id,
+                speed,
+                ep_evt,
+                b_evt,
+                &mut in_ctx,
+                csz,
+                &mut add_flags,
+                &mut max_dci,
+            );
+            let ain_prep = self.prepare_ep_ctx(
+                slot_id,
+                speed,
+                ep_ain,
+                b_ain,
+                &mut in_ctx,
+                csz,
+                &mut add_flags,
+                &mut max_dci,
+            );
+            let aout_prep = self.prepare_ep_ctx(
+                slot_id,
+                speed,
+                ep_aout,
+                b_aout,
+                &mut in_ctx,
+                csz,
+                &mut add_flags,
+                &mut max_dci,
+            );
+            if let (
+                Some((evt_dci, evt_ring)),
+                Some((ain_dci, ain_ring)),
+                Some((aout_dci, aout_ring)),
+            ) = (evt_prep, ain_prep, aout_prep)
+            {
+                bt_state = BtHciPipeState {
+                    active: true,
+                    is_realtek: is_realtek_rtl8821c_bt(dev_desc.vendor_id, dev_desc.product_id),
+                    vendor_id: dev_desc.vendor_id,
+                    product_id: dev_desc.product_id,
+                    evt_in_dci: evt_dci,
+                    evt_in_ring: evt_ring,
+                    acl_in_dci: ain_dci,
+                    acl_in_ring: ain_ring,
+                    acl_out_ep_addr: ep_aout.endpoint_address,
+                    acl_out_dci: aout_dci,
+                    acl_out_ring: aout_ring,
+                };
+            }
+        }
+
         if add_flags != (1 << 0) {
             let dev_copy = self.hw.borrow().devices[d_idx];
             let slot_params = SlotContextParams {
@@ -1511,6 +1831,7 @@ impl XhciController {
             dev.intr0 = intr0_pipe;
             dev.intr1 = intr1_pipe;
             dev.bot = bot_state;
+            dev.bt = bt_state;
         }
 
         if bot_state.active {
@@ -1519,6 +1840,12 @@ impl XhciController {
             } else {
                 self.hw.borrow_mut().devices[d_idx].bot.active = false;
             }
+        } else if bt_state.active {
+            role = UsbDeviceRole::BluetoothHci;
+            println!(
+                "[driver-host:xhci] USB Bluetooth HCI online slot={} vid={:#06x} pid={:#06x} realtek={}",
+                slot_id, bt_state.vendor_id, bt_state.product_id, bt_state.is_realtek
+            );
         }
 
         {
@@ -1560,6 +1887,22 @@ impl XhciController {
         }
         if intr1_pipe.kind != IntrPipeKind::None {
             self.arm_interrupt_pipe(slot_id, intr1_pipe);
+        }
+        if bt_state.active {
+            self.arm_bt_rx_pipe(
+                slot_id,
+                bt_state.evt_in_dci,
+                bt_state.evt_in_ring,
+                BT_EVT_IN_OFF,
+                BT_EVT_XFER_LEN,
+            );
+            self.arm_bt_rx_pipe(
+                slot_id,
+                bt_state.acl_in_dci,
+                bt_state.acl_in_ring,
+                BT_ACL_IN_OFF,
+                BT_ACL_XFER_LEN,
+            );
         }
         Ok(())
     }
@@ -2269,6 +2612,83 @@ impl XhciController {
         } else {
             Err(UsbError::TrbFailed(out.code))
         }
+    }
+
+    async fn bt_send_cmd_async(&self, slot_id: u8, cmd: &[u8]) -> Result<(), UsbError> {
+        if cmd.is_empty() || cmd.len() > 1024 {
+            return Err(UsbError::DescriptorInvalid);
+        }
+        let d_idx = usize::from(slot_id.saturating_sub(1));
+        if d_idx >= MAX_SLOTS {
+            return Err(UsbError::DeviceGone);
+        }
+        {
+            let hw = self.hw.borrow();
+            if !hw.devices[d_idx].active || !hw.devices[d_idx].bt.active {
+                return Err(UsbError::DeviceGone);
+            }
+        }
+        self.dma.copy_in(BT_CMD_OUT_OFF, cmd);
+        let setup = SetupPacket::bt_hci_command(cmd.len() as u16);
+        let ticket = {
+            let mut hw = self.hw.borrow_mut();
+            let r_idx = usize::from(hw.devices[d_idx].ep0_ring_idx);
+            let r = &mut hw.xfer_rings[r_idx];
+            let _ = enqueue_xfer_trb(
+                &self.dma,
+                r,
+                r_idx,
+                Trb::xfer_setup(setup.to_le_u64(), ControlTransferType::OutData),
+            );
+            let _ = enqueue_xfer_trb(
+                &self.dma,
+                r,
+                r_idx,
+                Trb::xfer_data(
+                    self.dma_phys + BT_CMD_OUT_OFF as u64,
+                    cmd.len() as u32,
+                    false,
+                ),
+            );
+            let status_phys = enqueue_xfer_trb(&self.dma, r, r_idx, Trb::xfer_status(true));
+            self.completions
+                .register(status_phys, slot_id)
+                .ok_or(UsbError::NoWaiters)?
+        };
+        self.ring_doorbell(slot_id, 1);
+        let out = self.await_ticket(ticket, XFER_TIMEOUT_TICKS).await?;
+        if out.is_transfer_ok() {
+            Ok(())
+        } else {
+            Err(UsbError::TrbFailed(out.code))
+        }
+    }
+
+    async fn bt_send_acl_async(&self, slot_id: u8, acl: &[u8]) -> Result<(), UsbError> {
+        if acl.is_empty() || acl.len() > 1024 {
+            return Err(UsbError::DescriptorInvalid);
+        }
+        let d_idx = usize::from(slot_id.saturating_sub(1));
+        if d_idx >= MAX_SLOTS {
+            return Err(UsbError::DeviceGone);
+        }
+        let bt = {
+            let hw = self.hw.borrow();
+            let dev = &hw.devices[d_idx];
+            if !dev.active || !dev.bt.active {
+                return Err(UsbError::DeviceGone);
+            }
+            dev.bt
+        };
+        self.dma.copy_in(BT_ACL_OUT_OFF, acl);
+        self.bulk_xfer_dma(
+            slot_id,
+            bt.acl_out_dci,
+            bt.acl_out_ring,
+            BT_ACL_OUT_OFF,
+            acl.len(),
+        )
+        .await
     }
 
     async fn submit_command(&self, cmd_trb: Trb) -> Result<TrbOutcome, UsbError> {

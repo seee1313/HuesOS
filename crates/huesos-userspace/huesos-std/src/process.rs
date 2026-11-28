@@ -88,6 +88,10 @@ pub enum Service {
     BlockDevice,
     /// The driver registry (`AT_HUESOS_REGISTRY`).
     Registry,
+    /// The `/net/btl` Bluetooth Classic transport service (`AT_HUESOS_BTL_SERVICE`).
+    BtlService,
+    /// The `audio-service` mixer/playback service (`AT_HUESOS_AUDIO_SERVICE`).
+    AudioService,
 }
 
 /// Builder for a child process, modelled on `std::process::Command`.
@@ -218,18 +222,24 @@ impl Command {
         let mut hxfs_service: Option<&Channel> = None;
         let mut block_dev: Option<&Channel> = None;
         let mut registry: Option<&Channel> = None;
+        let mut btl_service: Option<&Channel> = None;
+        let mut audio_service: Option<&Channel> = None;
         for (service, channel) in &self.services {
             match service {
                 Service::HxfsService => hxfs_service = Some(channel),
                 Service::HxfsDir => hxfs_dir = Some(channel),
                 Service::BlockDevice => block_dev = Some(channel),
                 Service::Registry => registry = Some(channel),
+                Service::BtlService => btl_service = Some(channel),
+                Service::AudioService => audio_service = Some(channel),
             }
         }
         caps.hxfs_dir = hxfs_dir;
         caps.hxfs_service = hxfs_service;
         caps.block_dev = block_dev;
         caps.registry = registry;
+        caps.btl_service = btl_service;
+        caps.audio_service = audio_service;
 
         let spawned = spawn_elf_from_vmo_with_caps(
             entry.path.as_str(),

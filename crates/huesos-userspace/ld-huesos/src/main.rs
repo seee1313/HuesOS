@@ -24,15 +24,17 @@ use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use huesos_abi::auxv::{
-    caps_mask, AuxEntry, AT_BASE, AT_ENTRY, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
-    AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR, AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP,
-    AT_HUESOS_LIB_VMO, AT_HUESOS_NET_SERVICE, AT_HUESOS_PE_LEN, AT_HUESOS_PE_OFFSET,
-    AT_HUESOS_PE_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT,
-    AT_HUESOS_WLAN_SERVICE, AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
-    LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL, LD_BOOTSTRAP_HXFS_SERVICE_LABEL,
-    LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_NET_SERVICE_LABEL, LD_BOOTSTRAP_PE_VMO_LABEL,
-    LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL, LD_BOOTSTRAP_STDERR_LABEL,
-    LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL, LD_BOOTSTRAP_WLAN_SERVICE_LABEL,
+    caps_mask, AuxEntry, AT_BASE, AT_ENTRY, AT_HUESOS_AUDIO_SERVICE, AT_HUESOS_BLOCK_DEV,
+    AT_HUESOS_BTL_SERVICE, AT_HUESOS_CAPS_MASK, AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR,
+    AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP, AT_HUESOS_LIB_VMO, AT_HUESOS_NET_SERVICE,
+    AT_HUESOS_PE_LEN, AT_HUESOS_PE_OFFSET, AT_HUESOS_PE_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR,
+    AT_HUESOS_STDIN, AT_HUESOS_STDOUT, AT_HUESOS_WLAN_SERVICE, AT_NULL, AT_PHDR, AT_PHENT,
+    AT_PHNUM, LD_BOOTSTRAP_AUDIO_SERVICE_LABEL, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
+    LD_BOOTSTRAP_BTL_SERVICE_LABEL, LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL,
+    LD_BOOTSTRAP_HXFS_SERVICE_LABEL, LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_NET_SERVICE_LABEL,
+    LD_BOOTSTRAP_PE_VMO_LABEL, LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
+    LD_BOOTSTRAP_STDERR_LABEL, LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL,
+    LD_BOOTSTRAP_WLAN_SERVICE_LABEL,
 };
 use huesos_abi::{
     rights, vmar_flags, vmo_create_flags, HandleValue, USER_HEAP_BASE, USER_HEAP_SIZE,
@@ -494,6 +496,8 @@ struct AuxInfo {
     expect_registry: bool,
     expect_net_service: bool,
     expect_wlan_service: bool,
+    expect_btl_service: bool,
+    expect_audio_service: bool,
     expect_pe_vmo: bool,
     pe_offset: u64,
     pe_len: u64,
@@ -524,6 +528,8 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
         expect_registry: false,
         expect_net_service: false,
         expect_wlan_service: false,
+        expect_btl_service: false,
+        expect_audio_service: false,
         expect_pe_vmo: false,
         pe_offset: 0,
         pe_len: 0,
@@ -562,6 +568,8 @@ fn parse_auxv(sp: *const u64) -> Option<AuxInfo> {
                 AT_HUESOS_REGISTRY => info.expect_registry = entry.a_val != 0,
                 AT_HUESOS_NET_SERVICE => info.expect_net_service = entry.a_val != 0,
                 AT_HUESOS_WLAN_SERVICE => info.expect_wlan_service = entry.a_val != 0,
+                AT_HUESOS_BTL_SERVICE => info.expect_btl_service = entry.a_val != 0,
+                AT_HUESOS_AUDIO_SERVICE => info.expect_audio_service = entry.a_val != 0,
                 AT_HUESOS_PE_VMO => info.expect_pe_vmo = entry.a_val != 0,
                 AT_HUESOS_PE_OFFSET => info.pe_offset = entry.a_val,
                 AT_HUESOS_PE_LEN => info.pe_len = entry.a_val,
@@ -584,6 +592,8 @@ struct BootstrapExtras {
     registry_ch: u32,
     net_service_ch: u32,
     wlan_service_ch: u32,
+    btl_service_ch: u32,
+    audio_service_ch: u32,
     pe_vmo: u32,
     pe_self_vmar: u32,
 }
@@ -814,6 +824,8 @@ fn register_process_ctx_into_libcanvas(
             registry_ch: extras.registry_ch,
             net_service_ch: extras.net_service_ch,
             wlan_service_ch: extras.wlan_service_ch,
+            btl_service_ch: extras.btl_service_ch,
+            audio_service_ch: extras.audio_service_ch,
             pe_vmo: extras.pe_vmo,
             pe_self_vmar: extras.pe_self_vmar,
             pe_offset: aux.pe_offset,
@@ -849,6 +861,8 @@ fn receive_bootstrap_handles(
     let mut registry_h: Option<Handle> = None;
     let mut net_svc_h: Option<Handle> = None;
     let mut wlan_svc_h: Option<Handle> = None;
+    let mut btl_svc_h: Option<Handle> = None;
+    let mut audio_svc_h: Option<Handle> = None;
     let mut pe_vmo_h: Option<Handle> = None;
     let mut buf = [0u8; 64];
 
@@ -864,6 +878,8 @@ fn receive_bootstrap_handles(
         || (aux.expect_registry && registry_h.is_none())
         || (aux.expect_net_service && net_svc_h.is_none())
         || (aux.expect_wlan_service && wlan_svc_h.is_none())
+        || (aux.expect_btl_service && btl_svc_h.is_none())
+        || (aux.expect_audio_service && audio_svc_h.is_none())
         || (aux.expect_pe_vmo && pe_vmo_h.is_none())
     {
         match bootstrap.read_optional_handle(&mut buf) {
@@ -902,6 +918,12 @@ fn receive_bootstrap_handles(
             }
             Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_WLAN_SERVICE_LABEL => {
                 wlan_svc_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_BTL_SERVICE_LABEL => {
+                btl_svc_h = Some(handle);
+            }
+            Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_AUDIO_SERVICE_LABEL => {
+                audio_svc_h = Some(handle);
             }
             Ok((n, Some(handle))) if &buf[..n] == LD_BOOTSTRAP_PE_VMO_LABEL => {
                 pe_vmo_h = Some(handle);
@@ -954,6 +976,8 @@ fn receive_bootstrap_handles(
         registry_ch: registry_h.map_or(INVALID_HANDLE, Handle::into_raw),
         net_service_ch: net_svc_h.map_or(INVALID_HANDLE, Handle::into_raw),
         wlan_service_ch: wlan_svc_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        btl_service_ch: btl_svc_h.map_or(INVALID_HANDLE, Handle::into_raw),
+        audio_service_ch: audio_svc_h.map_or(INVALID_HANDLE, Handle::into_raw),
         pe_vmo: pe_vmo_h.map_or(INVALID_HANDLE, Handle::into_raw),
         pe_self_vmar,
     };

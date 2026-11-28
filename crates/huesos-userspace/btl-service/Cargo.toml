@@ -1,0 +1,27 @@
+[package]
+name = "huesos-btl-service"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "huesos-btl-service"
+path = "src/main.rs"
+
+[features]
+default = []
+boot-selftest = []
+
+[dependencies]
+libcanvas = { path = "../libcanvas" }
+huesos-abi = { path = "../../huesos-abi" }
+huesos-bt = { path = "../../huesos-bt" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

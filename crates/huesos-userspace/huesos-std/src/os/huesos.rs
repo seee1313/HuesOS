@@ -50,6 +50,10 @@ pub enum Capability {
     Bootfs,
     /// The driver registry.
     Registry,
+    /// Plan 9 `/net/btl` Bluetooth Classic transport service.
+    BtlService,
+    /// Multi-stream `HARB` SPSC mixer + `VirtIO-Sound` / `A2DP` audio service.
+    AudioService,
 }
 
 impl Capability {
@@ -65,6 +69,8 @@ impl Capability {
             Capability::FrameDraw => CapKind::FrameDraw,
             Capability::Bootfs => CapKind::BootfsRo,
             Capability::Registry => CapKind::Registry,
+            Capability::BtlService => CapKind::BtlService,
+            Capability::AudioService => CapKind::AudioService,
         })
     }
 
@@ -80,6 +86,8 @@ impl Capability {
             Capability::FrameDraw => "fb",
             Capability::Bootfs => "bootfs",
             Capability::Registry => "registry",
+            Capability::BtlService => "btl",
+            Capability::AudioService => "audio",
         }
     }
 }
@@ -104,7 +112,7 @@ pub fn has_capability(capability: Capability) -> bool {
 
 /// The capabilities present right now, in declaration order.
 pub fn capabilities() -> Vec<Capability> {
-    const ALL: [Capability; 9] = [
+    const ALL: [Capability; 11] = [
         Capability::Stdin,
         Capability::Stdout,
         Capability::Stderr,
@@ -114,6 +122,8 @@ pub fn capabilities() -> Vec<Capability> {
         Capability::FrameDraw,
         Capability::Bootfs,
         Capability::Registry,
+        Capability::BtlService,
+        Capability::AudioService,
     ];
     ALL.iter()
         .copied()
@@ -222,6 +232,8 @@ pub fn capability_bit(capability: Capability) -> Option<u64> {
         Capability::FrameDraw => bits::FB_RO,
         Capability::Bootfs => bits::BOOTFS_RO,
         Capability::Registry => bits::QUERY_RO,
+        Capability::BtlService => bits::BTL_RO | bits::BTL_RW | bits::BTL_ADMIN,
+        Capability::AudioService => bits::AUDIO_RO | bits::AUDIO_RW | bits::AUDIO_ADMIN,
         // The three standard streams are always wired by the loader and have no
         // opt-in bit of their own.
         Capability::Stdin | Capability::Stdout | Capability::Stderr => return None,

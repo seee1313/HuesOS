@@ -3542,6 +3542,38 @@ fn run_driver_binding_and_handoff(
             max_vectors: 1,
             allow_polling_fallback: true,
         },
+        DriverManifestSpec {
+            driver_name: "driver-host-snd",
+            match_rule: DeviceMatchRule {
+                vendor_id: Some(0x1AF4),
+                device_id: Some(0x1059),
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: None,
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::IntxOnly,
+            max_vectors: 1,
+            allow_polling_fallback: true,
+        },
+        DriverManifestSpec {
+            driver_name: "driver-host-snd",
+            match_rule: DeviceMatchRule {
+                vendor_id: Some(0x1AF4),
+                device_id: Some(0x1018),
+                subsystem_vendor_id: None,
+                subsystem_id: None,
+                revision_id: None,
+                class: None,
+                required_capability_id: None,
+            },
+            relocation: RelocationClass::Fixed,
+            irq_preference: IrqPreference::IntxOnly,
+            max_vectors: 1,
+            allow_polling_fallback: true,
+        },
     ];
 
     let mut transport = ReadWriteTransport {
@@ -4238,6 +4270,137 @@ fn run_driver_binding_and_handoff(
                                 lease.address.function(),
                                 modern_caps.is_some(),
                                 bar0_io.is_some()
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                if manifest.driver_name == "driver-host-snd" {
+                    let max_config_bytes = if cfg!(feature = "force-legacy") {
+                        CONVENTIONAL_CONFIG_BYTES
+                    } else {
+                        ENHANCED_CONFIG_BYTES
+                    };
+                    enable_ancestor_bridges(
+                        &inv.snapshot,
+                        lease.address,
+                        &mut transport,
+                        max_config_bytes,
+                    );
+                    let modern_caps = parse_virtio_modern_caps(&cfg, &caps);
+                    if let Some((common, notify, isr, dev_cfg)) = modern_caps {
+                        let cmd_bits: u32 = 0x0406;
+                        let cmd_req = WriteRequest {
+                            address: lease.address,
+                            header_kind: HeaderKind::Type0Endpoint,
+                            class: WriteClass::CommandControl,
+                            offset: OFFSET_COMMAND,
+                            width: ConfigWidth::Word,
+                            max_config_bytes,
+                            value: u32::from(current_command) | cmd_bits,
+                            write_mask: cmd_bits,
+                            expected_readback_mask: cmd_bits,
+                            allowlist_entry: None,
+                        };
+                        let cmd_ok =
+                            write_policy::execute_checked_write(&mut transport, &cmd_req).is_ok();
+                        let needed_bars = [common.bar, notify.bar, isr.bar, dev_cfg.bar];
+                        let mut minted_bar_mask = 0u8;
+                        let mut all_modern_bars_ok = true;
+                        let mut minted_any = false;
+                        for &b_idx in &needed_bars {
+                            if b_idx == 0xFF || (minted_bar_mask & (1 << b_idx)) != 0 {
+                                continue;
+                            }
+                            let Some(bar_res) =
+                                plan.find(lease.address, ResourceRegister::Bar(b_idx))
+                            else {
+                                all_modern_bars_ok = false;
+                                break;
+                            };
+                            if bar_res.class == ResourceClass::Io || bar_res.len == 0 {
+                                all_modern_bars_ok = false;
+                                break;
+                            }
+                            match libcanvas::device_lease::mint_resource(
+                                &lease.handle,
+                                ResourceKindAbi::Mmio,
+                                lease.generation,
+                                bar_res.cpu_base,
+                                bar_res.len,
+                                true,
+                            ) {
+                                Ok(mmio_h) => {
+                                    let mut label = StackLabel::new();
+                                    let _ = write!(
+                                        label,
+                                        "resource:driver-host-snd:mmio:{:#x}:{:#x}:bar{}",
+                                        bar_res.cpu_base, bar_res.len, b_idx
+                                    );
+                                    let _ = bootstrap.write_handle(label.as_bytes(), mmio_h);
+                                    minted_bar_mask |= 1 << b_idx;
+                                    minted_any = true;
+                                }
+                                Err(_) => {
+                                    all_modern_bars_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_modern_bars_ok && minted_any {
+                            let mut meta = [0u8; 48];
+                            meta[0..4].copy_from_slice(b"VT10");
+                            meta[4] = common.bar;
+                            meta[5] = notify.bar;
+                            meta[6] = isr.bar;
+                            meta[7] = dev_cfg.bar;
+                            meta[8..12].copy_from_slice(&common.offset.to_le_bytes());
+                            meta[12..16].copy_from_slice(&common.length.to_le_bytes());
+                            meta[16..20].copy_from_slice(&notify.offset.to_le_bytes());
+                            meta[20..24].copy_from_slice(&notify.length.to_le_bytes());
+                            meta[24..28].copy_from_slice(&notify.notify_multiplier.to_le_bytes());
+                            meta[28..32].copy_from_slice(&isr.offset.to_le_bytes());
+                            meta[32..36].copy_from_slice(&isr.length.to_le_bytes());
+                            meta[36..40].copy_from_slice(&dev_cfg.offset.to_le_bytes());
+                            meta[40..44].copy_from_slice(&dev_cfg.length.to_le_bytes());
+                            let bdf_packed = pack_pci_address(
+                                lease.address.segment(),
+                                lease.address.bus(),
+                                lease.address.device(),
+                                lease.address.function(),
+                            )
+                            .unwrap_or(0) as u32;
+                            meta[44..48].copy_from_slice(&bdf_packed.to_le_bytes());
+                            if let Some(vmo_h) = mint_ro_metadata_vmo(&meta) {
+                                let mut label = StackLabel::new();
+                                let _ = write!(
+                                    label,
+                                    "resource:driver-host-snd:virtio1:{:#x}:48:ro",
+                                    bdf_packed
+                                );
+                                let _ = bootstrap.write_handle(label.as_bytes(), vmo_h);
+                            }
+                            if let Ok(ro_lease) =
+                                lease.handle.duplicate(rights::READ | rights::TRANSFER)
+                            {
+                                let _ = bootstrap
+                                    .write_handle(pci_manager::DEVICE_LEASE_SND_RO_LABEL, ro_lease);
+                            }
+                            if let Ok(rw_lease) = lease
+                                .handle
+                                .duplicate(rights::READ | rights::WRITE | rights::TRANSFER)
+                            {
+                                let _ = bootstrap
+                                    .write_handle(pci_manager::DEVICE_LEASE_SND_RW_LABEL, rw_lease);
+                            }
+                            println!(
+                                "[pci-manager] obs virtio-snd bdf={:02x}:{:02x}.{} cmd_ok={} isolation={} status=handed-off",
+                                lease.address.bus(),
+                                lease.address.device(),
+                                lease.address.function(),
+                                cmd_ok,
+                                isolation_str
                             );
                         }
                     }

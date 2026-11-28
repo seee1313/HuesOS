@@ -44,6 +44,7 @@
 
 extern crate alloc;
 
+pub mod audio;
 pub mod bootfs;
 pub mod buffered;
 pub mod collections;
@@ -62,6 +63,7 @@ pub mod thread;
 pub mod time;
 pub mod tui;
 pub mod usb_fat;
+pub mod vfs_synth;
 
 pub use error::{Error, ErrorKind, Result};
 pub use libcanvas::heap::ScudoHeap;

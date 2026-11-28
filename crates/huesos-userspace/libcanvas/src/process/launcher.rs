@@ -5,12 +5,13 @@ use crate::handle::Handle;
 use crate::memory;
 use crate::vmo::Vmo;
 use huesos_abi::auxv::{
-    caps_mask, AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_BLOCK_DEV, AT_HUESOS_CAPS_MASK,
-    AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR, AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP,
-    AT_HUESOS_LIB_VMO, AT_HUESOS_NET_SERVICE, AT_HUESOS_PE_LEN, AT_HUESOS_PE_OFFSET,
-    AT_HUESOS_PE_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR, AT_HUESOS_STDIN, AT_HUESOS_STDOUT,
-    AT_HUESOS_WLAN_SERVICE, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM,
-    LD_BOOTSTRAP_BLOCK_DEV_LABEL, LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL,
+    caps_mask, AT_BASE, AT_ENTRY, AT_FLAGS, AT_HUESOS_AUDIO_SERVICE, AT_HUESOS_BLOCK_DEV,
+    AT_HUESOS_BTL_SERVICE, AT_HUESOS_CAPS_MASK, AT_HUESOS_FRAME_DRAW, AT_HUESOS_HXFS_DIR,
+    AT_HUESOS_HXFS_SERVICE, AT_HUESOS_LD_BOOTSTRAP, AT_HUESOS_LIB_VMO, AT_HUESOS_NET_SERVICE,
+    AT_HUESOS_PE_LEN, AT_HUESOS_PE_OFFSET, AT_HUESOS_PE_VMO, AT_HUESOS_REGISTRY, AT_HUESOS_STDERR,
+    AT_HUESOS_STDIN, AT_HUESOS_STDOUT, AT_HUESOS_WLAN_SERVICE, AT_NULL, AT_PAGESZ, AT_PHDR,
+    AT_PHENT, AT_PHNUM, AT_RANDOM, LD_BOOTSTRAP_AUDIO_SERVICE_LABEL, LD_BOOTSTRAP_BLOCK_DEV_LABEL,
+    LD_BOOTSTRAP_BTL_SERVICE_LABEL, LD_BOOTSTRAP_FRAME_DRAW_LABEL, LD_BOOTSTRAP_HXFS_DIR_LABEL,
     LD_BOOTSTRAP_HXFS_SERVICE_LABEL, LD_BOOTSTRAP_LIB_VMO_LABEL, LD_BOOTSTRAP_NET_SERVICE_LABEL,
     LD_BOOTSTRAP_PE_VMO_LABEL, LD_BOOTSTRAP_REGISTRY_LABEL, LD_BOOTSTRAP_SELF_VMAR_LABEL,
     LD_BOOTSTRAP_STDERR_LABEL, LD_BOOTSTRAP_STDIN_LABEL, LD_BOOTSTRAP_STDOUT_LABEL,
@@ -63,6 +64,10 @@ pub struct SpawnCaps<'a> {
     pub net_service: Option<&'a Channel>,
     /// Optional `wlan-service` channel (`AT_HUESOS_WLAN_SERVICE`).
     pub wlan_service: Option<&'a Channel>,
+    /// Optional `btl-service` (`Plan 9 /net/btl`) channel (`AT_HUESOS_BTL_SERVICE`).
+    pub btl_service: Option<&'a Channel>,
+    /// Optional `audio-service` (`/dev/audio`) channel (`AT_HUESOS_AUDIO_SERVICE`).
+    pub audio_service: Option<&'a Channel>,
     /// Optional CPU pinning affinity.
     pub home_cpu: Option<usize>,
     /// Initial user stack size in bytes.
@@ -85,6 +90,8 @@ impl<'a> SpawnCaps<'a> {
             registry: None,
             net_service: None,
             wlan_service: None,
+            btl_service: None,
+            audio_service: None,
             home_cpu: None,
             stack_size: huesos_abi::USER_STACK_DEFAULT_SIZE,
         }
@@ -794,6 +801,14 @@ fn finish_dynamic_launch(
         Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
         None => None,
     };
+    let btl_svc_dup = match caps.btl_service {
+        Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
+        None => None,
+    };
+    let audio_svc_dup = match caps.audio_service {
+        Some(ch) => Some(ch.handle().duplicate(rights::SAME_RIGHTS)?),
+        None => None,
+    };
     let pe_vmo_dup = match pe_target {
         Some(pe) => Some(
             pe.vmo
@@ -809,6 +824,8 @@ fn finish_dynamic_launch(
         Ok(ch) => ch,
         Err(err) => {
             drop(pe_vmo_dup);
+            drop(audio_svc_dup);
+            drop(btl_svc_dup);
             drop(wlan_svc_dup);
             drop(net_svc_dup);
             drop(registry_dup);
@@ -825,7 +842,7 @@ fn finish_dynamic_launch(
         }
     };
 
-    let sends: [(&[u8], Option<Handle>); 13] = [
+    let sends: [(&[u8], Option<Handle>); 15] = [
         (LD_BOOTSTRAP_SELF_VMAR_LABEL, Some(vmar_dup)),
         (LD_BOOTSTRAP_LIB_VMO_LABEL, Some(lib_vmo_dup)),
         (LD_BOOTSTRAP_HXFS_DIR_LABEL, hxfs_dir_dup),
@@ -838,6 +855,8 @@ fn finish_dynamic_launch(
         (LD_BOOTSTRAP_REGISTRY_LABEL, registry_dup),
         (LD_BOOTSTRAP_NET_SERVICE_LABEL, net_svc_dup),
         (LD_BOOTSTRAP_WLAN_SERVICE_LABEL, wlan_svc_dup),
+        (LD_BOOTSTRAP_BTL_SERVICE_LABEL, btl_svc_dup),
+        (LD_BOOTSTRAP_AUDIO_SERVICE_LABEL, audio_svc_dup),
         (LD_BOOTSTRAP_PE_VMO_LABEL, pe_vmo_dup),
     ];
     for (idx, (label, maybe_h)) in sends.into_iter().enumerate() {
@@ -999,7 +1018,7 @@ fn map_dynamic_initial_stack(
     top_page[rand_off + 8..rand_off + 16].copy_from_slice(&r1.to_le_bytes());
     let rand_va = top_page_va + rand_off as u64;
 
-    let aux_entries: [(u64, u64); 25] = [
+    let aux_entries: [(u64, u64); 27] = [
         (AT_PHDR, at_phdr),
         (AT_PHENT, u64::from(at_phent)),
         (AT_PHNUM, u64::from(at_phnum)),
@@ -1026,6 +1045,11 @@ fn map_dynamic_initial_stack(
         (
             AT_HUESOS_WLAN_SERVICE,
             u64::from(caps.wlan_service.is_some()),
+        ),
+        (AT_HUESOS_BTL_SERVICE, u64::from(caps.btl_service.is_some())),
+        (
+            AT_HUESOS_AUDIO_SERVICE,
+            u64::from(caps.audio_service.is_some()),
         ),
         (AT_HUESOS_PE_VMO, u64::from(pe_target.is_some())),
         (AT_HUESOS_PE_OFFSET, pe_target.map_or(0, |pe| pe.offset)),

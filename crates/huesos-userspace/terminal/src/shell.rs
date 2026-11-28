@@ -509,6 +509,21 @@ impl TerminalSession {
         self.screen.render();
 
         let result = (|| -> libcanvas::Result<()> {
+            if self.registry.write(b"open:audio:rw").is_ok() {
+                let mut rbuf = [0u8; 64];
+                for _ in 0..32 {
+                    match self.registry.read_optional_handle_timeout(&mut rbuf, 2) {
+                        Ok((n, Some(audio_h))) if &rbuf[..n] == b"service:audio:channel" => {
+                            let _ = self.supervisor.write_handle(b"system:doom-audio", audio_h);
+                            break;
+                        }
+                        Ok((n, None)) if rbuf[..n].starts_with(b"err:audio") => break,
+                        Ok((_, Some(other))) => drop(other),
+                        Ok(_) | Err(ErrorCode::ShouldWait) | Err(ErrorCode::TimedOut) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
             let keyboard = self.keyboard.duplicate()?;
             self.supervisor
                 .write_handle(b"system:launch-doom", keyboard.into_handle())

@@ -371,4 +371,36 @@ mod tests {
         assert_eq!(exec.poll(), 2);
         assert!(exec.is_empty());
     }
+
+    #[test]
+    fn bluetooth_usb_hci_and_rtl8821ce_matching() {
+        use super::ch9::{
+            is_bluetooth_hci_interface, is_realtek_rtl8821c_bt, REALTEK_RTL8821CE_BT_PIDS,
+            REALTEK_USB_VENDOR_ID, USB_CLASS_VENDOR_SPEC, USB_CLASS_WIRELESS_CONTROLLER,
+            WL_PROTO_BLUETOOTH_HCI, WL_SUBCLASS_RF,
+        };
+        for pid in REALTEK_RTL8821CE_BT_PIDS {
+            assert!(is_realtek_rtl8821c_bt(REALTEK_USB_VENDOR_ID, pid));
+            assert!(is_bluetooth_hci_interface(
+                REALTEK_USB_VENDOR_ID,
+                pid,
+                0,
+                USB_CLASS_VENDOR_SPEC,
+                0x01,
+                0x01,
+            ));
+        }
+        assert!(!is_realtek_rtl8821c_bt(0x8087, 0x0029));
+        assert!(is_bluetooth_hci_interface(
+            0x8087,
+            0x0029,
+            0,
+            USB_CLASS_WIRELESS_CONTROLLER,
+            WL_SUBCLASS_RF,
+            WL_PROTO_BLUETOOTH_HCI,
+        ));
+        let setup = SetupPacket::bt_hci_command(3);
+        assert_eq!(setup.bm_request_type, 0x20);
+        assert_eq!(setup.w_length, 3);
+    }
 }

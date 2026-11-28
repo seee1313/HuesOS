@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use huesos_abi::auxv::caps_mask;
+use huesos_abi::btl::{self, BtlKeySummary, BtlOp, BtlPeerInfo, BtlStatus, BtlStatusSnapshot};
 use huesos_abi::net::{
     self, decode_dns_reply, decode_ping_reply, encode_dns_request, encode_ping_request,
     encode_simple_request, NetOp, NetStatus, NetStatusSnapshot, PingResult,
@@ -23,6 +24,7 @@ use crate::os::huesos::caps_mask as current_caps_mask;
 
 static NET_SERVICE_CH: Mutex<Option<Channel>> = Mutex::new(None);
 static WLAN_SERVICE_CH: Mutex<Option<Channel>> = Mutex::new(None);
+static BTL_SERVICE_CH: Mutex<Option<Channel>> = Mutex::new(None);
 
 fn map_net_status(st: NetStatus) -> Error {
     let kind = match st {
@@ -701,6 +703,451 @@ pub fn wlan_ap_stop() -> Result<()> {
             Ok(())
         } else {
             Err(map_wlan_status(st))
+        }
+    })
+}
+
+// =========================================================================
+// Plan 9 `/net/btl` Bluetooth Classic Client (`HBTL` -> `/services/btl.elf`)
+// =========================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BtlCapLevel {
+    ReadOnly,
+    ReadWrite,
+    Admin,
+}
+
+fn map_btl_status(st: BtlStatus) -> Error {
+    let kind = match st {
+        BtlStatus::Ok => ErrorKind::Other,
+        BtlStatus::InvalidRequest => ErrorKind::InvalidInput,
+        BtlStatus::AccessDenied => ErrorKind::AccessDenied,
+        BtlStatus::HardwareAbsent | BtlStatus::FirmwareFailed => ErrorKind::Unsupported,
+        BtlStatus::NotConnected => ErrorKind::HostUnreachable,
+        BtlStatus::AuthFailed => ErrorKind::AuthFailed,
+        BtlStatus::Refused => ErrorKind::ConnectionRefused,
+        BtlStatus::WouldBlock => ErrorKind::ShouldWait,
+        BtlStatus::ChannelClosed => ErrorKind::PeerClosed,
+        BtlStatus::Congested => ErrorKind::Busy,
+    };
+    Error::new(kind)
+}
+
+fn check_btl_cap(level: BtlCapLevel) -> Result<()> {
+    let mask = current_caps_mask();
+    if (mask & caps_mask::BTL_RO) == 0 {
+        return Err(Error::capability());
+    }
+    match level {
+        BtlCapLevel::ReadOnly => Ok(()),
+        BtlCapLevel::ReadWrite => {
+            if (mask & caps_mask::BTL_RW) == 0 {
+                return Err(Error::capability());
+            }
+            Ok(())
+        }
+        BtlCapLevel::Admin => {
+            if (mask & caps_mask::BTL_ADMIN) == 0 {
+                return Err(Error::capability());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn with_btl_channel<F, T>(level: BtlCapLevel, f: F) -> Result<T>
+where
+    F: FnOnce(&Channel) -> Result<T>,
+{
+    check_btl_cap(level)?;
+    let mut guard = BTL_SERVICE_CH.lock();
+    if guard.is_none() {
+        if let Some(h) = take_cap_handle(CapKind::BtlService) {
+            *guard = Some(Channel::from_handle(h));
+        }
+    }
+    let Some(ch) = guard.as_ref() else {
+        return Err(Error::capability());
+    };
+    f(ch)
+}
+
+/// Parse a Bluetooth `BD_ADDR` (`"AA:BB:CC:DD:EE:FF"`, display MSB-first) into
+/// little-endian HCI byte order (`[FF, EE, DD, CC, BB, AA]`).
+pub fn parse_bd_addr(text: &str) -> Option<[u8; 6]> {
+    let mut big = [0u8; 6];
+    let mut count = 0usize;
+    for part in text.trim().split(':') {
+        if count >= 6 || part.len() != 2 {
+            return None;
+        }
+        big[count] = u8::from_str_radix(part, 16).ok()?;
+        count += 1;
+    }
+    if count != 6 {
+        return None;
+    }
+    Some([big[5], big[4], big[3], big[2], big[1], big[0]])
+}
+
+/// Format a little-endian HCI `BD_ADDR` into canonical `"AA:BB:CC:DD:EE:FF"`.
+pub fn format_bd_addr(bd_addr: &[u8; 6]) -> alloc::string::String {
+    alloc::format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        bd_addr[5],
+        bd_addr[4],
+        bd_addr[3],
+        bd_addr[2],
+        bd_addr[1],
+        bd_addr[0]
+    )
+}
+
+/// Query `/services/btl.elf` controller status (`btl=ro`).
+pub fn btl_status() -> Result<BtlStatusSnapshot> {
+    with_btl_channel(BtlCapLevel::ReadOnly, |ch| {
+        let mut req = [0u8; 8];
+        btl::write_header(&mut req, BtlOp::Status, BtlStatus::Ok);
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 128];
+        let n = ch
+            .read_into_timeout(&mut rep, 500)
+            .map_err(Error::from_code)?;
+        BtlStatusSnapshot::decode_reply(&rep[..n]).map_err(map_btl_status)
+    })
+}
+
+fn decode_peer_list(rep: &[u8], expected_op: BtlOp) -> Result<Vec<BtlPeerInfo>> {
+    let st = btl::check_header(rep, expected_op).map_err(map_btl_status)?;
+    if st != BtlStatus::Ok {
+        return Err(map_btl_status(st));
+    }
+    if rep.len() < 12 {
+        return Err(Error::new(ErrorKind::InvalidInput));
+    }
+    let count = usize::from(rep[8]).min(btl::MAX_PEERS);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 12 + i * BtlPeerInfo::WIRE_LEN;
+        if off + BtlPeerInfo::WIRE_LEN > rep.len() {
+            break;
+        }
+        if let Some(peer) = BtlPeerInfo::decode(&rep[off..off + BtlPeerInfo::WIRE_LEN]) {
+            out.push(peer);
+        }
+    }
+    Ok(out)
+}
+
+/// Trigger Bluetooth Classic Inquiry + EIR discovery (`btl=admin`).
+pub fn btl_scan() -> Result<Vec<BtlPeerInfo>> {
+    with_btl_channel(BtlCapLevel::Admin, |ch| {
+        let mut req = [0u8; 8];
+        btl::write_header(&mut req, BtlOp::Scan, BtlStatus::Ok);
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 1152];
+        let n = ch
+            .read_into_timeout(&mut rep, 2500)
+            .map_err(Error::from_code)?;
+        decode_peer_list(&rep[..n], BtlOp::Scan)
+    })
+}
+
+/// List cached discovered/connected Bluetooth peers (`btl=ro`).
+pub fn btl_list_peers() -> Result<Vec<BtlPeerInfo>> {
+    with_btl_channel(BtlCapLevel::ReadOnly, |ch| {
+        let mut req = [0u8; 8];
+        btl::write_header(&mut req, BtlOp::ListPeers, BtlStatus::Ok);
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 1152];
+        let n = ch
+            .read_into_timeout(&mut rep, 500)
+            .map_err(Error::from_code)?;
+        decode_peer_list(&rep[..n], BtlOp::ListPeers)
+    })
+}
+
+/// Pair with `bd_addr` using SSP Just-Works and persist Link Key on `HxFS` (`btl=admin`).
+pub fn btl_pair(bd_addr: [u8; 6]) -> Result<()> {
+    with_btl_channel(BtlCapLevel::Admin, |ch| {
+        let mut req = [0u8; 14];
+        btl::write_header(&mut req, BtlOp::Pair, BtlStatus::Ok);
+        req[8..14].copy_from_slice(&bd_addr);
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 32];
+        let n = ch
+            .read_into_timeout(&mut rep, 2500)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::Pair).map_err(map_btl_status)?;
+        if st == BtlStatus::Ok {
+            Ok(())
+        } else {
+            Err(map_btl_status(st))
+        }
+    })
+}
+
+/// Open an encrypted ACL baseband link to `bd_addr` (`btl=admin`).
+pub fn btl_connect_acl(bd_addr: [u8; 6]) -> Result<u16> {
+    with_btl_channel(BtlCapLevel::Admin, |ch| {
+        let mut req = [0u8; 14];
+        btl::write_header(&mut req, BtlOp::ConnectAcl, BtlStatus::Ok);
+        req[8..14].copy_from_slice(&bd_addr);
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 32];
+        let n = ch
+            .read_into_timeout(&mut rep, 2000)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::ConnectAcl).map_err(map_btl_status)?;
+        if st != BtlStatus::Ok {
+            return Err(map_btl_status(st));
+        }
+        let handle = if n >= 10 {
+            u16::from_le_bytes([rep[8], rep[9]])
+        } else {
+            0
+        };
+        Ok(handle)
+    })
+}
+
+/// Disconnect an active ACL baseband link (`btl=admin`).
+pub fn btl_disconnect_acl(bd_addr: [u8; 6]) -> Result<()> {
+    with_btl_channel(BtlCapLevel::Admin, |ch| {
+        let mut req = [0u8; 14];
+        btl::write_header(&mut req, BtlOp::DisconnectAcl, BtlStatus::Ok);
+        req[8..14].copy_from_slice(&bd_addr);
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 32];
+        let n = ch
+            .read_into_timeout(&mut rep, 1000)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::DisconnectAcl).map_err(map_btl_status)?;
+        if st == BtlStatus::Ok {
+            Ok(())
+        } else {
+            Err(map_btl_status(st))
+        }
+    })
+}
+
+/// List non-secret 4-byte SHA-256 Link Key fingerprints (`btl=ro`).
+pub fn btl_list_keys() -> Result<Vec<BtlKeySummary>> {
+    with_btl_channel(BtlCapLevel::ReadOnly, |ch| {
+        let mut req = [0u8; 8];
+        btl::write_header(&mut req, BtlOp::ListKeys, BtlStatus::Ok);
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 256];
+        let n = ch
+            .read_into_timeout(&mut rep, 500)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::ListKeys).map_err(map_btl_status)?;
+        if st != BtlStatus::Ok {
+            return Err(map_btl_status(st));
+        }
+        if n < 12 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let count = usize::from(rep[8]).min(btl::MAX_KEY_SUMMARIES);
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 12 + i * BtlKeySummary::WIRE_LEN;
+            if off + BtlKeySummary::WIRE_LEN > n {
+                break;
+            }
+            if let Some(summary) = BtlKeySummary::decode(&rep[off..off + BtlKeySummary::WIRE_LEN]) {
+                out.push(summary);
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Delete a stored Link Key for `bd_addr` (`btl=admin`).
+pub fn btl_delete_key(bd_addr: [u8; 6]) -> Result<()> {
+    with_btl_channel(BtlCapLevel::Admin, |ch| {
+        let mut req = [0u8; 14];
+        btl::write_header(&mut req, BtlOp::DeleteKey, BtlStatus::Ok);
+        req[8..14].copy_from_slice(&bd_addr);
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 32];
+        let n = ch
+            .read_into_timeout(&mut rep, 500)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::DeleteKey).map_err(map_btl_status)?;
+        if st == BtlStatus::Ok {
+            Ok(())
+        } else {
+            Err(map_btl_status(st))
+        }
+    })
+}
+
+/// Result of a remote Bluetooth SDP service query (`BtlOp::SdpQuery`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtlSdpResult {
+    /// True if the requested Service Class UUID was advertised by the peer.
+    pub found: bool,
+    /// Discovered L2CAP PSM (`0x0019` for AVDTP, `0x0017` for AVRCP, etc.).
+    pub l2cap_psm: u16,
+    /// Discovered profile version (`0x0103` = v1.3, `0x0104` = v1.4, etc.).
+    pub profile_version: u16,
+    /// Raw SDP attribute list payload returned by the peer.
+    pub raw_attrs: Vec<u8>,
+}
+
+/// Query a peer's SDP server (`PSM 0x0001`) for `uuid16` (`btl=rw`).
+pub fn btl_sdp_query(bd_addr: [u8; 6], uuid16: u16) -> Result<BtlSdpResult> {
+    with_btl_channel(BtlCapLevel::ReadWrite, |ch| {
+        let mut req = [0u8; 16];
+        btl::write_header(&mut req, BtlOp::SdpQuery, BtlStatus::Ok);
+        req[8..14].copy_from_slice(&bd_addr);
+        req[14..16].copy_from_slice(&uuid16.to_le_bytes());
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 576];
+        let n = ch
+            .read_into_timeout(&mut rep, 2000)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::SdpQuery).map_err(map_btl_status)?;
+        if st != BtlStatus::Ok {
+            return Err(map_btl_status(st));
+        }
+        if n < 16 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let found = rep[8] != 0;
+        let l2cap_psm = u16::from_le_bytes([rep[10], rep[11]]);
+        let profile_version = u16::from_le_bytes([rep[12], rep[13]]);
+        let raw_len = usize::from(u16::from_le_bytes([rep[14], rep[15]])).min(n.saturating_sub(16));
+        Ok(BtlSdpResult {
+            found,
+            l2cap_psm,
+            profile_version,
+            raw_attrs: rep[16..16 + raw_len].to_vec(),
+        })
+    })
+}
+
+/// Open an outbound L2CAP connection-oriented channel (`btl=rw`), returning `(local_cid, peer_mtu)`.
+pub fn btl_l2cap_connect(bd_addr: [u8; 6], psm: u16) -> Result<(u16, u16)> {
+    with_btl_channel(BtlCapLevel::ReadWrite, |ch| {
+        let mut req = [0u8; 16];
+        btl::write_header(&mut req, BtlOp::L2capConnect, BtlStatus::Ok);
+        req[8..14].copy_from_slice(&bd_addr);
+        req[14..16].copy_from_slice(&psm.to_le_bytes());
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 32];
+        let n = ch
+            .read_into_timeout(&mut rep, 2000)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::L2capConnect).map_err(map_btl_status)?;
+        if st != BtlStatus::Ok {
+            return Err(map_btl_status(st));
+        }
+        if n < 16 {
+            return Err(Error::new(ErrorKind::InvalidInput));
+        }
+        let cid = u16::from_le_bytes([rep[8], rep[9]]);
+        let mtu = u16::from_le_bytes([rep[10], rep[11]]);
+        Ok((cid, mtu))
+    })
+}
+
+/// Close an open L2CAP channel (`btl=rw`).
+pub fn btl_l2cap_close(local_cid: u16) -> Result<()> {
+    with_btl_channel(BtlCapLevel::ReadWrite, |ch| {
+        let mut req = [0u8; 10];
+        btl::write_header(&mut req, BtlOp::L2capClose, BtlStatus::Ok);
+        req[8..10].copy_from_slice(&local_cid.to_le_bytes());
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 16];
+        let n = ch
+            .read_into_timeout(&mut rep, 500)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::L2capClose).map_err(map_btl_status)?;
+        if st == BtlStatus::Ok {
+            Ok(())
+        } else {
+            Err(map_btl_status(st))
+        }
+    })
+}
+
+/// Read the complete `btsnoop` v1 (`RFC 1761`) capture buffer (`btl=ro`).
+pub fn btl_read_snoop() -> Result<Vec<u8>> {
+    with_btl_channel(BtlCapLevel::ReadOnly, |ch| {
+        let mut out = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let mut req = [0u8; 14];
+            btl::write_header(&mut req, BtlOp::ReadSnoop, BtlStatus::Ok);
+            req[8..12].copy_from_slice(&offset.to_le_bytes());
+            req[12..14].copy_from_slice(&960u16.to_le_bytes());
+            ch.write(&req).map_err(Error::from_code)?;
+            let mut rep = [0u8; 1024];
+            let n = ch
+                .read_into_timeout(&mut rep, 500)
+                .map_err(Error::from_code)?;
+            let st = btl::check_header(&rep[..n], BtlOp::ReadSnoop).map_err(map_btl_status)?;
+            if st != BtlStatus::Ok {
+                return Err(map_btl_status(st));
+            }
+            if n < 16 {
+                break;
+            }
+            let total = u32::from_le_bytes([rep[8], rep[9], rep[10], rep[11]]) as usize;
+            let chunk_len =
+                usize::from(u16::from_le_bytes([rep[12], rep[13]])).min(n.saturating_sub(16));
+            if chunk_len == 0 {
+                break;
+            }
+            out.extend_from_slice(&rep[16..16 + chunk_len]);
+            offset = offset.saturating_add(chunk_len as u32);
+            if out.len() >= total || out.len() >= 65_536 {
+                break;
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Set controller power mode (`0` = off, `1` = on, `2` = virtual `"HuesOS AirBuds Pro"` + on) (`btl=admin`).
+pub fn btl_set_power(mode: u8) -> Result<()> {
+    with_btl_channel(BtlCapLevel::Admin, |ch| {
+        let mut req = [0u8; 9];
+        btl::write_header(&mut req, BtlOp::SetPower, BtlStatus::Ok);
+        req[8] = mode;
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 32];
+        let n = ch
+            .read_into_timeout(&mut rep, 1500)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::SetPower).map_err(map_btl_status)?;
+        if st == BtlStatus::Ok {
+            Ok(())
+        } else {
+            Err(map_btl_status(st))
+        }
+    })
+}
+
+/// Update `RTL8821CE` 2.4 GHz Wi-Fi/BT PTA coexistence hint (`0..=3`) (`btl=rw`).
+pub fn btl_set_coex_hint(profile: u8) -> Result<()> {
+    with_btl_channel(BtlCapLevel::ReadWrite, |ch| {
+        let mut req = [0u8; 9];
+        btl::write_header(&mut req, BtlOp::SetCoexHint, BtlStatus::Ok);
+        req[8] = profile;
+        ch.write(&req).map_err(Error::from_code)?;
+        let mut rep = [0u8; 32];
+        let n = ch
+            .read_into_timeout(&mut rep, 500)
+            .map_err(Error::from_code)?;
+        let st = btl::check_header(&rep[..n], BtlOp::SetCoexHint).map_err(map_btl_status)?;
+        if st == BtlStatus::Ok {
+            Ok(())
+        } else {
+            Err(map_btl_status(st))
         }
     })
 }

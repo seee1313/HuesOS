@@ -39,6 +39,52 @@ pub const MSC_SUBCLASS_SCSI: u8 = 0x06;
 /// Mass Storage protocol: Bulk-Only Transport (`BBB`, `0x50`).
 pub const MSC_PROTO_BULK_ONLY: u8 = 0x50;
 
+/// USB interface/device class: Wireless Controller (`0xE0`).
+pub const USB_CLASS_WIRELESS_CONTROLLER: u8 = 0xE0;
+/// Wireless Controller subclass: RF Controller (`0x01`).
+pub const WL_SUBCLASS_RF: u8 = 0x01;
+/// Wireless Controller protocol: Bluetooth Primary Controller HCI (`0x01`).
+pub const WL_PROTO_BLUETOOTH_HCI: u8 = 0x01;
+/// USB interface/device class: Vendor Specific (`0xFF`).
+pub const USB_CLASS_VENDOR_SPEC: u8 = 0xFF;
+
+/// USB Vendor ID for Realtek Semiconductor Corp. (`0x0BDA`).
+pub const REALTEK_USB_VENDOR_ID: u16 = 0x0BDA;
+
+/// Known Realtek `RTL8821CE` M.2 combo card USB Bluetooth Product IDs.
+pub const REALTEK_RTL8821CE_BT_PIDS: [u16; 5] = [0xC821, 0xB00A, 0xC820, 0x8821, 0xB00C];
+
+/// True if `(vendor_id, product_id)` matches any Realtek `RTL8821CE` Bluetooth USB function.
+pub const fn is_realtek_rtl8821c_bt(vendor_id: u16, product_id: u16) -> bool {
+    if vendor_id != REALTEK_USB_VENDOR_ID {
+        return false;
+    }
+    matches!(product_id, 0xC821 | 0xB00A | 0xC820 | 0x8821 | 0xB00C)
+}
+
+/// True if a USB interface (on a device with `vendor_id:product_id`) is a Primary
+/// Bluetooth HCI transport (`0xE0/0x01/0x01` or Realtek `RTL8821CE` interface `0`).
+pub const fn is_bluetooth_hci_interface(
+    vendor_id: u16,
+    product_id: u16,
+    interface_number: u8,
+    interface_class: u8,
+    interface_subclass: u8,
+    interface_protocol: u8,
+) -> bool {
+    if interface_class == USB_CLASS_WIRELESS_CONTROLLER
+        && interface_subclass == WL_SUBCLASS_RF
+        && interface_protocol == WL_PROTO_BLUETOOTH_HCI
+        && interface_number == 0
+    {
+        return true;
+    }
+    is_realtek_rtl8821c_bt(vendor_id, product_id)
+        && interface_number == 0
+        && (interface_class == USB_CLASS_WIRELESS_CONTROLLER
+            || interface_class == USB_CLASS_VENDOR_SPEC)
+}
+
 /// 8-byte USB Control `Setup` packet (`IDT = 1` immediate payload for xHCI).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupPacket {
@@ -124,6 +170,17 @@ impl SetupPacket {
             w_value: ((duration_4ms as u16) << 8) | (report_id as u16),
             w_index: interface_num as u16,
             w_length: 0,
+        }
+    }
+
+    /// Bluetooth USB Primary Controller HCI Command Control OUT (`bmRequestType = 0x20`).
+    pub const fn bt_hci_command(cmd_len: u16) -> Self {
+        Self {
+            bm_request_type: 0x20,
+            b_request: 0x00,
+            w_value: 0,
+            w_index: 0,
+            w_length: cmd_len,
         }
     }
 

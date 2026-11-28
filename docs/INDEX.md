@@ -35,6 +35,7 @@ treating roadmaps as current feature claims.
   [BOOTFS.md](BOOTFS.md), [ASYNC_RUNTIME.md](ASYNC_RUNTIME.md).
 - [STORAGE_PRODUCTION_GATE.md](STORAGE_PRODUCTION_GATE.md) — Stage-Z release checklist (storage remains not production-ready).
 - [NETWORKING.md](NETWORKING.md) — `net-service` (VirtIO TCP/IP), `wlan-service` (`rtw88` 802.11 WPA2-CCMP), and `huesos-tls` (TLS 1.3).
+- [AUDIO_AND_BTL.md](AUDIO_AND_BTL.md) — `/net/btl` Bluetooth Classic (`RTL8821CE` `btrtl` USB-HCI, SSP, L2CAP, SDP, `btsnoop`, PTA coex) and `audio-service` (`VirtIO-Sound` PCIe, `HARB` SPSC VMO mixer, A2DP `SBC` + `AVRCP`, Doom SFX & OPL2).
 - [FRAMEBUFFER_POLICY.md](FRAMEBUFFER_POLICY.md), [TERMINAL_RENDERING.md](TERMINAL_RENDERING.md),
   [SNAKE.md](SNAKE.md), [DOOM.md](DOOM.md), [SHUTDOWN.md](SHUTDOWN.md).
 

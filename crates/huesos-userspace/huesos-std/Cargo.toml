@@ -10,6 +10,8 @@ path = "src/lib.rs"
 [dependencies]
 libcanvas = { path = "../libcanvas", default-features = false, features = ["dyn-client", "thread-tasks"] }
 huesos-abi = { path = "../../huesos-abi" }
+huesos-audio = { path = "../../huesos-audio" }
+huesos-bt = { path = "../../huesos-bt" }
 huesos-fat = { path = "../../huesos-fat" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex", "rwlock", "once", "lazy", "barrier"] }
 

@@ -108,6 +108,9 @@ const KNOWN_COMMANDS: &[&str] = &[
     "curl",
     "netctl",
     "wlanctl",
+    "btctl",
+    "audioctl",
+    "aplay",
     "sleep",
     "hsh",
 ];
@@ -174,6 +177,8 @@ extern "C" fn hsh_entry() -> ! {
     let block_dev = take_cap_handle(CapKind::BlockDev).map(Channel::from_handle);
     let net_svc = take_cap_handle(CapKind::NetService).map(Channel::from_handle);
     let wlan_svc = take_cap_handle(CapKind::WlanService).map(Channel::from_handle);
+    let btl_svc = take_cap_handle(CapKind::BtlService).map(Channel::from_handle);
+    let audio_svc = take_cap_handle(CapKind::AudioService).map(Channel::from_handle);
 
     if args.first().map(String::as_str) == Some("--interactive") {
         let stdin_ch = take_cap_handle(CapKind::Stdin).map(Channel::from_handle);
@@ -191,6 +196,7 @@ extern "C" fn hsh_entry() -> ! {
             Some(out_ch),
         );
         host.set_net_wlan_caps(net_svc, wlan_svc);
+        host.set_btl_audio_caps(btl_svc, audio_svc);
         host.status_hook = Some(send_status_bar);
         run_interactive(in_ch, host);
     }
@@ -198,6 +204,7 @@ extern "C" fn hsh_entry() -> ! {
     // Batch / `-c` / script file mode.
     let mut host = HshHost::new_with_caps(registry, hxfs_svc, block_dev, bootfs, frame_draw, None);
     host.set_net_wlan_caps(net_svc, wlan_svc);
+    host.set_btl_audio_caps(btl_svc, audio_svc);
     let mut env = ShellEnv::new();
 
     let script = if args.first().map(String::as_str) == Some("-c") {
@@ -1402,6 +1409,80 @@ impl InteractiveShell {
             println!("[hsh] @caps(net=ro,wlan=ro) enforcement OK");
         } else {
             println!("[hsh] @caps(net=ro,wlan=ro) enforcement FAILED");
+        }
+
+        // 10c-btl. `/net/btl` Bluetooth Classic (`HBTL` v1) + SSP Just-Works +
+        //          HxFS SHA-256 Link Key fingerprint + SDP (`0x110B` A2DP Sink)
+        //          + `btsnoop` (`RFC 1761`) + Plan 9 VFS (`/net/btl/status`).
+        match smoke_env.eval_script(
+            "btctl power virtual ; btctl scan ; btctl pair 52:54:00:B7:A2:D9 ; btctl keys ; btctl sdp 52:54:00:B7:A2:D9 0x110B ; btctl snoop ; cat /net/btl/status",
+            &mut self.host,
+        ) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("HuesOS AirBuds Pro")
+                    && res.render_text().contains("52:54:00:B7:A2:D9")
+                    && res.render_text().contains("found=true psm=0x0019")
+                    && res.render_text().contains("magic_ok=true")
+                    && res.render_text().contains("saved_keys=1") =>
+            {
+                println!("[hsh] btctl SSP + SDP + btsnoop OK");
+            }
+            Ok(res) => println!(
+                "[hsh] btctl smoke FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] btctl smoke ERROR: {e}"),
+        }
+
+        // 10c-audio. `audio-service` (`HAUD` v1) + `/net/btl` A2DP (`AVDTP` +
+        //            `SBC` + `AVRCP`) + `VirtIO-Sound` mirror routing +
+        //            lock-free `HARB` SPSC VMO `aplay` RIFF/WAVE playback.
+        match smoke_env.eval_script(
+            "audioctl route mirror ; audioctl bt-connect 52:54:00:B7:A2:D9 ; audioctl volume 85 ; aplay --gen-wav - 523 120 | aplay - ; cat /dev/audio/status",
+            &mut self.host,
+        ) {
+            Ok(res)
+                if res.status == 0
+                    && res.render_text().contains("HuesOS AirBuds Pro")
+                    && res.render_text().contains("btl_streaming=true")
+                    && res.render_text().contains("played '-'")
+                    && !res.render_text().contains("mixed_frames=0\n")
+                    && !res.render_text().contains("btl_rtp_packets=0\n") =>
+            {
+                println!("[hsh] audioctl A2DP + HARB VMO aplay OK");
+            }
+            Ok(res) => println!(
+                "[hsh] audioctl/aplay smoke FAILED status={} out={}",
+                res.status,
+                res.render_text()
+            ),
+            Err(e) => println!("[hsh] audioctl/aplay smoke ERROR: {e}"),
+        }
+
+        let ro_btl_admin = smoke_env.eval_script("@caps(btl=ro) btctl scan", &mut self.host);
+        let ro_btl_rw = smoke_env.eval_script(
+            "@caps(btl=ro) btctl sdp 52:54:00:B7:A2:D9 0x110B",
+            &mut self.host,
+        );
+        let ro_audio_admin =
+            smoke_env.eval_script("@caps(audio=ro) audioctl volume 50", &mut self.host);
+        let ro_audio_rw =
+            smoke_env.eval_script("@caps(audio=ro) aplay --synth 440 40", &mut self.host);
+        let ro_status_ok = smoke_env.eval_script(
+            "@caps(btl=ro,audio=ro) btctl status ; @caps(btl=ro,audio=ro) audioctl status",
+            &mut self.host,
+        );
+        if ro_btl_admin.is_ok_and(|r| r.status != 0)
+            && ro_btl_rw.is_ok_and(|r| r.status != 0)
+            && ro_audio_admin.is_ok_and(|r| r.status != 0)
+            && ro_audio_rw.is_ok_and(|r| r.status != 0)
+            && ro_status_ok.is_ok_and(|r| r.status == 0)
+        {
+            println!("[hsh] @caps(btl=ro,audio=ro) enforcement OK");
+        } else {
+            println!("[hsh] @caps(btl=ro,audio=ro) enforcement FAILED");
         }
 
         // 10d. `/bin/df.elf` is the smallest of the new disk utilities: it

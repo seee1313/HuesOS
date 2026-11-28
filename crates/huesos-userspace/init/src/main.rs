@@ -381,6 +381,7 @@ pub extern "C" fn _start() -> ! {
     );
     let mut supervisor_message = [0u8; 64];
     let mut doom_process: Option<Process> = None;
+    let mut pending_doom_audio: Option<Channel> = None;
     loop {
         let _keep_services_alive = (&driver_manager, &key_broker);
         if let Some((_, channel)) = &terminal {
@@ -411,16 +412,21 @@ pub extern "C" fn _start() -> ! {
                         fallback_legacy_shutdown(&mut logger);
                     }
                 }
+                Ok((n, Some(handle))) if &supervisor_message[..n] == b"system:doom-audio" => {
+                    pending_doom_audio = Some(Channel::from_handle(handle));
+                }
                 Ok((n, Some(handle))) if &supervisor_message[..n] == b"system:launch-doom" => {
                     if doom_process.is_none() {
                         doom_process = launch_doom(
                             &mut logger,
                             channel,
                             Channel::from_handle(handle),
+                            pending_doom_audio.take(),
                             &bootfs,
                             &frame_draw,
                         );
                     } else {
+                        pending_doom_audio = None;
                         init_logln!(logger, "[init] Doom is already running");
                         let _ = channel.write(b"doom:error:busy");
                     }
@@ -464,6 +470,7 @@ fn launch_doom(
     logger: &mut InitLogger,
     terminal: &Channel,
     keyboard: Channel,
+    audio: Option<Channel>,
     bootfs: &Vmo,
     frame_draw: &libcanvas::handle::Handle,
 ) -> Option<Process> {
@@ -477,6 +484,10 @@ fn launch_doom(
         bootstrap
             .write_handle(b"keyboard", keyboard.into_handle())
             .map_err(|(error, _handle)| error)?;
+
+        if let Some(audio_ch) = audio {
+            let _ = bootstrap.write_handle(b"audio", audio_ch.into_handle());
+        }
 
         let wad_vmo = bootfs.duplicate(libcanvas::rights::READ | libcanvas::rights::TRANSFER)?;
         let mut metadata = [0u8; 20];
@@ -798,8 +809,9 @@ fn send_boot_dma_pool_grant(
     }
 
     // Carve isolated `[64..68 MiB)` (`net-service`), `[68..72 MiB)` (`wlan-service`),
-    // and `[72..76 MiB)` (`driver-host-xhci`) regardless of `init.storage=off` so
-    // networking, Wi-Fi, USB HID, and USB BOT work on Live ISO / ramdisk boots too.
+    // `[72..76 MiB)` (`driver-host-xhci`), and `[76..80 MiB)` (`driver-host-snd`)
+    // regardless of `init.storage=off` so networking, Wi-Fi, USB HID/BOT/BT, and
+    // VirtIO-Sound work on Live ISO / ramdisk boots too.
     if info.dma_pool.len >= storage_boot::NET_DMA_OFFSET + storage_boot::NET_DMA_LEN {
         let net_grant = ResourceGrant {
             kind: kind::DMA_POOL,
@@ -891,6 +903,38 @@ fn send_boot_dma_pool_grant(
                     "[init] driver-host-xhci DMA pool transferred: dma={:#x}+{:#x}",
                     xhci_grant.base,
                     xhci_grant.len
+                );
+            }
+        }
+    }
+
+    if info.dma_pool.len >= storage_boot::AUDIO_DMA_OFFSET + storage_boot::AUDIO_DMA_LEN {
+        let snd_grant = ResourceGrant {
+            kind: kind::DMA_POOL,
+            base: info.dma_pool.base + storage_boot::AUDIO_DMA_OFFSET,
+            len: storage_boot::AUDIO_DMA_LEN,
+            exclusive: true,
+        };
+        if let Ok(res) = Resource::create(
+            snd_grant.kind,
+            snd_grant.base,
+            snd_grant.len,
+            snd_grant.exclusive,
+        ) {
+            let mut label = [0u8; 96];
+            let n = format_grant_label(&mut label, "driver-host-snd", &snd_grant);
+            if dm_bootstrap
+                .write_handle(&label[..n.min(label.len())], res.into_handle())
+                .is_ok()
+            {
+                let mut done = [0u8; 64];
+                let dn = format_grants_complete_label(&mut done, "driver-host-snd");
+                let _ = dm_bootstrap.write(&done[..dn.min(done.len())]);
+                init_logln!(
+                    logger,
+                    "[init] driver-host-snd DMA pool transferred: dma={:#x}+{:#x}",
+                    snd_grant.base,
+                    snd_grant.len
                 );
             }
         }

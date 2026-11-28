@@ -42,6 +42,24 @@ pub enum WlanAccess {
     Admin,
 }
 
+/// `/net/btl` Bluetooth transport capability access level (`@caps(btl=none|ro|rw|admin)`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BtlAccess {
+    None,
+    ReadOnly,
+    ReadWrite,
+    Admin,
+}
+
+/// `/dev/audio` service capability access level (`@caps(audio=none|ro|rw|admin)`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioAccess {
+    None,
+    ReadOnly,
+    ReadWrite,
+    Admin,
+}
+
 /// Scoped HxFS directory grant (`@caps(dir=/subpath:ro)`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirGrant {
@@ -59,6 +77,8 @@ pub struct CapsSpec {
     pub dir: Option<DirGrant>,
     pub net: NetAccess,
     pub wlan: WlanAccess,
+    pub btl: BtlAccess,
+    pub audio: AudioAccess,
 }
 
 impl Default for CapsSpec {
@@ -71,6 +91,8 @@ impl Default for CapsSpec {
             dir: None,
             net: NetAccess::ReadWrite,
             wlan: WlanAccess::Admin,
+            btl: BtlAccess::Admin,
+            audio: AudioAccess::Admin,
         }
     }
 }
@@ -112,6 +134,22 @@ impl CapsSpec {
             WlanAccess::None => {}
             WlanAccess::ReadOnly => mask |= caps_mask::WLAN_RO,
             WlanAccess::Admin => mask |= caps_mask::WLAN_RO | caps_mask::WLAN_ADMIN,
+        }
+        match self.btl {
+            BtlAccess::None => {}
+            BtlAccess::ReadOnly => mask |= caps_mask::BTL_RO,
+            BtlAccess::ReadWrite => mask |= caps_mask::BTL_RO | caps_mask::BTL_RW,
+            BtlAccess::Admin => {
+                mask |= caps_mask::BTL_RO | caps_mask::BTL_RW | caps_mask::BTL_ADMIN
+            }
+        }
+        match self.audio {
+            AudioAccess::None => {}
+            AudioAccess::ReadOnly => mask |= caps_mask::AUDIO_RO,
+            AudioAccess::ReadWrite => mask |= caps_mask::AUDIO_RO | caps_mask::AUDIO_RW,
+            AudioAccess::Admin => {
+                mask |= caps_mask::AUDIO_RO | caps_mask::AUDIO_RW | caps_mask::AUDIO_ADMIN
+            }
         }
         mask
     }
@@ -179,6 +217,24 @@ impl CapsSpec {
                         "ro" => WlanAccess::ReadOnly,
                         "admin" | "rw" => WlanAccess::Admin,
                         _ => return Err(alloc::format!("invalid wlan cap '{val}'")),
+                    };
+                }
+                "btl" => {
+                    out.btl = match val {
+                        "none" => BtlAccess::None,
+                        "ro" => BtlAccess::ReadOnly,
+                        "rw" => BtlAccess::ReadWrite,
+                        "admin" => BtlAccess::Admin,
+                        _ => return Err(alloc::format!("invalid btl cap '{val}'")),
+                    };
+                }
+                "audio" => {
+                    out.audio = match val {
+                        "none" => AudioAccess::None,
+                        "ro" => AudioAccess::ReadOnly,
+                        "rw" => AudioAccess::ReadWrite,
+                        "admin" => AudioAccess::Admin,
+                        _ => return Err(alloc::format!("invalid audio cap '{val}'")),
                     };
                 }
                 "dir" => {

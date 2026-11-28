@@ -29,7 +29,7 @@ for line in lines:
 if cur:
     blocks.append(cur)
 if blocks:
-    for b in blocks[-5:]:
+    for b in blocks[-20:]:
         text = "\n".join(b[:25])
         m = re.search(r"-->\s+([^:\s]+):(\d+):(\d+)", text)
         esc = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -125,37 +125,45 @@ run_clippy_suite() {
             cargo clippy --release --features pci-force-legacy -- -D warnings
     )
 
-    for program in driver-host-input driver-host-nvme driver-host-xhci hxfs-service net-service wlan-service terminal doom fdisk hsh-bin huesos-std coreutils fault-probe dyn-rust-smoke acpi-manager uacpi-runtime pci-manager pci-hotplug-test shutdown-broker key-broker ld-huesos ld-pe; do
+    local suite_rc=0
+    for program in driver-host-input driver-host-nvme driver-host-xhci driver-host-snd hxfs-service net-service wlan-service btl-service audio-service terminal doom fdisk hsh-bin huesos-std coreutils fault-probe dyn-rust-smoke acpi-manager uacpi-runtime pci-manager pci-hotplug-test shutdown-broker key-broker ld-huesos ld-pe; do
         (
             cd "crates/huesos-userspace/$program"
             cargo clippy --release -- -D warnings
-        )
+        ) || suite_rc=1
     done
 
     (
         cd crates/huesos-userspace/win64-runtime
         cargo clippy --release --workspace -- -D warnings
-    )
+    ) || suite_rc=1
 
     (
         cd crates/huesos-userspace/pci-manager
         cargo clippy --release --features force-legacy -- -D warnings
-    )
+    ) || suite_rc=1
 
     (
         cd crates/huesos-userspace/acpi-manager
         cargo clippy --release --features restart-smoke -- -D warnings
-    )
+    ) || suite_rc=1
 
     (
         cd crates/huesos-userspace/wlan-service
         cargo clippy --release --features boot-selftest -- -D warnings
-    )
+    ) || suite_rc=1
+
+    (
+        cd crates/huesos-userspace/btl-service
+        cargo clippy --release --features boot-selftest -- -D warnings
+    ) || suite_rc=1
 
     (
         cd crates/huesos-userspace/hsh-bin
         cargo clippy --release --features boot-selftest -- -D warnings
-    )
+    ) || suite_rc=1
+
+    return "$suite_rc"
 }
 
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
