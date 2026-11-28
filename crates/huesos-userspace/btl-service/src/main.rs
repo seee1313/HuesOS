@@ -899,8 +899,8 @@ impl BtlRuntime {
                     match opcode {
                         OP_READ_LOCAL_VERSION => {
                             if let Some(ver) = parse_local_version_return(return_params) {
-                                self.local_hci_ver = ver.hci_version;
-                                self.local_hci_rev = ver.hci_revision;
+                                self.local_hci_ver = ver.hci_ver;
+                                self.local_hci_rev = ver.hci_rev;
                                 self.local_manufacturer = ver.manufacturer;
                                 self.local_lmp_subver = ver.lmp_subver;
                             }
