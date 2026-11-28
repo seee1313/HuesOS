@@ -162,7 +162,7 @@ fn run() -> i32 {
             cu::errln(&format!("aplay: stream write failed: {e}"));
             return 1;
         }
-        stream.drain(u64::from(ms).saturating_add(2_500));
+        stream.drain(u32::from(ms).saturating_add(2_500));
         cu::outln(&format!(
             "aplay: streamed {} stereo frames ({freq}Hz/{ms}ms) on HARB stream #{}",
             samples.len() / 2,

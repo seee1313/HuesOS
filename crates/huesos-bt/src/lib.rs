@@ -45,7 +45,9 @@ mod tests {
         AclCreditTracker, AclReassembler, BdAddr, BtUsbAclReassembler, BtUsbEvtReassembler,
         DecodedHciEvent, EVT_INQUIRY_RESULT_RSSI, H4_CMD, H4_EVT,
     };
-    use super::l2cap::{wrap_l2cap_pdu, L2capEngine, L2capEvent, PSM_AVDTP, PSM_SDP};
+    use super::l2cap::{
+        wrap_l2cap_pdu, L2capChanState, L2capEngine, L2capEvent, CID_SIGNALING, PSM_AVDTP, PSM_SDP,
+    };
     use super::sdp::{
         build_query_audio_sink_req, handle_sdp_request, parse_audio_sink_response,
         SDP_SVC_SEARCH_ATTR_REQ, UUID_AUDIO_SOURCE,
@@ -510,7 +512,11 @@ mod tests {
                 0x04, 0x09, 0x08, 0x00, 0x40, 0x00, 0x00, 0x00, 0x01, 0x02, 0x7F, 0x03,
             ],
         );
-        assert!(l2.is_open(cid));
-        assert_eq!(l2.remote_mtu(cid), 895);
+        let Some(ch) = l2.channel(cid) else {
+            assert!(false);
+            return;
+        };
+        assert_eq!(ch.state, L2capChanState::Open);
+        assert_eq!(ch.remote_mtu, 895);
     }
 }

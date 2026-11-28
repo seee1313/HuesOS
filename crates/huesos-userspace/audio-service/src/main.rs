@@ -1137,10 +1137,11 @@ impl AudioRuntime {
                 let in_frames = interleaved_pcm.len() / 2;
                 let out_frames = ((in_frames as u64) * u64::from(sink_hz))
                     .div_ceil(u64::from(self.mix_sample_rate.max(8_000)))
+                    .saturating_add(2)
                     .clamp(1, (MIX_QUANTUM_FRAMES * 2) as u64)
                     as usize;
                 let mut rs_accum = [0i32; MIX_QUANTUM_FRAMES * 4];
-                let produced = sink.sink_resampler.resample_and_accumulate(
+                let (_consumed, produced) = sink.sink_resampler.resample_and_accumulate(
                     interleaved_pcm,
                     256,
                     &mut rs_accum[..out_frames * 2],
