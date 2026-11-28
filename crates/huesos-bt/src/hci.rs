@@ -36,6 +36,8 @@ pub const OP_AUTH_REQUESTED: u16 = 0x0411;
 pub const OP_SET_CONN_ENCRYPTION: u16 = 0x0413;
 /// `HCI_Remote_Name_Request` (`OGF 0x01, OCF 0x0019`).
 pub const OP_REMOTE_NAME_REQ: u16 = 0x0419;
+/// `HCI_Remote_Name_Request_Cancel` (`OGF 0x01, OCF 0x001A`).
+pub const OP_REMOTE_NAME_REQ_CANCEL: u16 = 0x041A;
 /// `HCI_IO_Capability_Request_Reply` (`OGF 0x01, OCF 0x002B`).
 pub const OP_IO_CAP_REPLY: u16 = 0x042B;
 /// `HCI_User_Confirmation_Request_Reply` (`OGF 0x01, OCF 0x002C`).
@@ -65,6 +67,8 @@ pub const OP_WRITE_SIMPLE_PAIRING_MODE: u16 = 0x0C56;
 
 /// `HCI_Read_Local_Version_Information` (`OGF 0x04, OCF 0x0001`).
 pub const OP_READ_LOCAL_VERSION: u16 = 0x1001;
+/// `HCI_Read_Local_Supported_Features` (`OGF 0x04, OCF 0x0003`).
+pub const OP_READ_LOCAL_FEATURES: u16 = 0x1003;
 /// `HCI_Read_Buffer_Size` (`OGF 0x04, OCF 0x0005`).
 pub const OP_READ_BUFFER_SIZE: u16 = 0x1005;
 /// `HCI_Read_BD_ADDR` (`OGF 0x04, OCF 0x0009`).
@@ -288,6 +292,11 @@ pub fn cmd_read_bd_addr(out: &mut [u8]) -> Option<usize> {
     encode_cmd(OP_READ_BD_ADDR, &[], out)
 }
 
+/// Build `HCI_Read_Local_Supported_Features (0x1003)`.
+pub fn cmd_read_local_features(out: &mut [u8]) -> Option<usize> {
+    encode_cmd(OP_READ_LOCAL_FEATURES, &[], out)
+}
+
 /// Build `HCI_Read_Buffer_Size (0x1005)`.
 pub fn cmd_read_buffer_size(out: &mut [u8]) -> Option<usize> {
     encode_cmd(OP_READ_BUFFER_SIZE, &[], out)
@@ -362,6 +371,11 @@ pub fn cmd_remote_name_request(
     params[7] = 0;
     params[8..10].copy_from_slice(&clock_offset.to_le_bytes());
     encode_cmd(OP_REMOTE_NAME_REQ, &params, out)
+}
+
+/// Build `HCI_Remote_Name_Request_Cancel (0x041A)`.
+pub fn cmd_remote_name_request_cancel(addr: BdAddr, out: &mut [u8]) -> Option<usize> {
+    encode_cmd(OP_REMOTE_NAME_REQ_CANCEL, &addr.0, out)
 }
 
 /// Build `HCI_Create_Connection (0x0405)` with multi-slot ACL packet types (`DM1/DH1/DM3/DH3/DM5/DH5`).
@@ -712,12 +726,18 @@ pub fn decode_event(pkt: &[u8]) -> Option<DecodedHciEvent<'_>> {
         EVT_INQUIRY_COMPLETE if !p.is_empty() => {
             Some(DecodedHciEvent::InquiryComplete { status: p[0] })
         }
-        EVT_INQUIRY_RESULT if p.len() > 14 && p[0] >= 1 => {
+        EVT_INQUIRY_RESULT if !p.is_empty() && p[0] >= 1 => {
+            let n = usize::from(p[0]);
+            if p.len() < 1 + n * 14 {
+                return None;
+            }
             let mut addr = [0u8; 6];
             addr.copy_from_slice(&p[1..7]);
-            let psrm = p[7];
-            let cod = ClassOfDevice([p[10], p[11], p[12]]);
-            let clk = u16::from_le_bytes([p[13], p[14]]);
+            let psrm = p[1 + 6 * n];
+            let cod_off = 1 + 9 * n;
+            let cod = ClassOfDevice([p[cod_off], p[cod_off + 1], p[cod_off + 2]]);
+            let clk_off = 1 + 12 * n;
+            let clk = u16::from_le_bytes([p[clk_off], p[clk_off + 1]]);
             Some(DecodedHciEvent::PeerDiscovered(DiscoveredPeer {
                 addr: BdAddr(addr),
                 page_scan_rep_mode: psrm,
@@ -729,13 +749,19 @@ pub fn decode_event(pkt: &[u8]) -> Option<DecodedHciEvent<'_>> {
                 advertises_a2dp_sink: cod.is_audio_sink_candidate(),
             }))
         }
-        EVT_INQUIRY_RESULT_RSSI if p.len() > 14 && p[0] >= 1 => {
+        EVT_INQUIRY_RESULT_RSSI if !p.is_empty() && p[0] >= 1 => {
+            let n = usize::from(p[0]);
+            if p.len() < 1 + n * 14 {
+                return None;
+            }
             let mut addr = [0u8; 6];
             addr.copy_from_slice(&p[1..7]);
-            let psrm = p[7];
-            let cod = ClassOfDevice([p[9], p[10], p[11]]);
-            let clk = u16::from_le_bytes([p[12], p[13]]);
-            let rssi = p[14] as i8;
+            let psrm = p[1 + 6 * n];
+            let cod_off = 1 + 8 * n;
+            let cod = ClassOfDevice([p[cod_off], p[cod_off + 1], p[cod_off + 2]]);
+            let clk_off = 1 + 11 * n;
+            let clk = u16::from_le_bytes([p[clk_off], p[clk_off + 1]]);
+            let rssi = p[1 + 13 * n] as i8;
             Some(DecodedHciEvent::PeerDiscovered(DiscoveredPeer {
                 addr: BdAddr(addr),
                 page_scan_rep_mode: psrm,
@@ -1061,5 +1087,96 @@ impl AclReassembler {
             return Some((handle, cid, payload));
         }
         None
+    }
+}
+
+/// USB Interrupt IN HCI Event stream reassembler matching Linux `btusb_recv_intr` (`btusb_main.c`).
+///
+/// Handles both multi-URB fragmented events (e.g. 257-byte `Extended_Inquiry_Result` split across
+/// 16-byte `wMaxPacketSize` Interrupt IN packets) and coalesced multi-event URBs.
+#[derive(Clone, Debug, Default)]
+pub struct BtUsbEvtReassembler {
+    buf: Vec<u8>,
+    expect: usize,
+}
+
+impl BtUsbEvtReassembler {
+    /// Reset any in-flight partial event state (e.g. across `0xFC66` firmware drop or controller reset).
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.expect = 0;
+    }
+
+    /// Feed raw Interrupt IN bytes and return zero or more complete HCI event frames.
+    pub fn push_chunk(&mut self, mut chunk: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while !chunk.is_empty() {
+            if self.buf.is_empty() {
+                self.expect = 2;
+            }
+            let take = self.expect.min(chunk.len());
+            self.buf.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+            self.expect -= take;
+
+            if self.buf.len() == 2 && self.expect == 0 {
+                self.expect = usize::from(self.buf[1]);
+            }
+
+            if self.expect == 0 {
+                let completed = core::mem::take(&mut self.buf);
+                out.push(completed);
+                // Per Linux `btusb_recv_intr`: a 1-byte stray trailer inside the same URB
+                // after a complete event cannot begin a valid 2-byte event header.
+                if !chunk.is_empty() && chunk.len() < 2 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// USB Bulk IN HCI ACL stream reassembler matching Linux `btusb_recv_bulk` (`btusb_main.c`).
+#[derive(Clone, Debug, Default)]
+pub struct BtUsbAclReassembler {
+    buf: Vec<u8>,
+    expect: usize,
+}
+
+impl BtUsbAclReassembler {
+    /// Reset any in-flight partial ACL frame state.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.expect = 0;
+    }
+
+    /// Feed raw Bulk IN bytes and return zero or more complete HCI ACL packets.
+    pub fn push_chunk(&mut self, mut chunk: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while !chunk.is_empty() {
+            if self.buf.is_empty() {
+                self.expect = 4;
+            }
+            let take = self.expect.min(chunk.len());
+            self.buf.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+            self.expect -= take;
+
+            if self.buf.len() == 4 && self.expect == 0 {
+                let dlen = usize::from(u16::from_le_bytes([self.buf[2], self.buf[3]]));
+                if dlen > 1024 {
+                    self.reset();
+                    break;
+                }
+                self.expect = dlen;
+            }
+
+            if self.expect == 0 {
+                let completed = core::mem::take(&mut self.buf);
+                out.push(completed);
+            }
+        }
+        out
     }
 }

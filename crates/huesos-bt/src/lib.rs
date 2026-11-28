@@ -34,12 +34,16 @@ pub mod virtual_bt;
 #[cfg(test)]
 mod tests {
     use super::btrtl::{
-        is_rtl8821ce_usb_id, parse_and_assemble_rtl8821c, OP_RTL_DOWNLOAD, PROJECT_ID_8821C,
-        REALTEK_USB_VID, RTL_DOWNLOAD_CHUNK_DATA,
+        cmd_drop_firmware, cmd_read_rom_version, cmd_vendor_read_reg16, is_rtl8821ce_usb_id,
+        matches_rtl8821c_rom, parse_and_assemble_rtl8821c, parse_and_assemble_rtl8821c_with_key,
+        AssembledRtlFirmware, HCI_REV_8821C, HCI_VER_8821C, LMP_SUBVER_8821C, OP_RTL_DOWNLOAD,
+        OP_RTL_DROP_FIRMWARE, OP_RTL_READ_REG16, OP_RTL_READ_ROM_VERSION, PROJECT_ID_8821C,
+        REALTEK_USB_VID, RTL_DOWNLOAD_CHUNK_DATA, RTL_REG_CHIP_SUBVER, RTL_REG_SEC_PROJ,
     };
     use super::hci::{
         cmd_create_connection, cmd_inquiry_giac, decode_event, segment_l2cap_to_acl,
-        AclCreditTracker, AclReassembler, BdAddr, DecodedHciEvent, H4_CMD, H4_EVT,
+        AclCreditTracker, AclReassembler, BdAddr, BtUsbAclReassembler, BtUsbEvtReassembler,
+        DecodedHciEvent, EVT_INQUIRY_RESULT_RSSI, H4_CMD, H4_EVT,
     };
     use super::l2cap::{wrap_l2cap_pdu, L2capEngine, L2capEvent, PSM_AVDTP, PSM_SDP};
     use super::sdp::{
@@ -68,6 +72,34 @@ mod tests {
     fn real_rtl8821ce_firmware_parses_both_revisions_and_chunks_cleanly() {
         assert!(is_rtl8821ce_usb_id(REALTEK_USB_VID, 0xC821));
         assert!(is_rtl8821ce_usb_id(REALTEK_USB_VID, 0xB00A));
+        assert!(matches_rtl8821c_rom(
+            LMP_SUBVER_8821C,
+            HCI_REV_8821C,
+            HCI_VER_8821C
+        ));
+        assert_eq!(OP_RTL_READ_ROM_VERSION, 0xFC6D);
+        assert_eq!(OP_RTL_READ_REG16, 0xFC61);
+        assert_eq!(OP_RTL_DROP_FIRMWARE, 0xFC66);
+
+        let mut vcmd = [0u8; 16];
+        assert_eq!(cmd_read_rom_version(&mut vcmd), Some(3));
+        assert_eq!(&vcmd[..3], &[0x6D, 0xFC, 0x00]);
+        assert_eq!(cmd_drop_firmware(&mut vcmd), Some(3));
+        assert_eq!(&vcmd[..3], &[0x66, 0xFC, 0x00]);
+        assert_eq!(
+            cmd_vendor_read_reg16(&RTL_REG_CHIP_SUBVER, &mut vcmd),
+            Some(8)
+        );
+        assert_eq!(
+            &vcmd[..8],
+            &[0x61, 0xFC, 0x05, 0x10, 0x38, 0x04, 0x28, 0x80]
+        );
+        assert_eq!(cmd_vendor_read_reg16(&RTL_REG_SEC_PROJ, &mut vcmd), Some(8));
+        assert_eq!(
+            &vcmd[..8],
+            &[0x61, 0xFC, 0x05, 0x10, 0xA4, 0xAD, 0x00, 0xB0]
+        );
+
         let fw = include_bytes!("../../../third_party/firmware/rtl_bt/rtl8821c_fw.bin");
         let cfg = include_bytes!("../../../third_party/firmware/rtl_bt/rtl8821c_config.bin");
 
@@ -78,20 +110,30 @@ mod tests {
         };
         assert_eq!(assembled_a.project_id, PROJECT_ID_8821C);
         assert_eq!(assembled_a.chip_id, 1);
+        assert_eq!(assembled_a.fw_version, 0x826C_A99E);
         assert_eq!(assembled_a.payload.len(), 15472 + cfg.len());
 
-        // Revision B-cut (`rom_version = 1` -> `chip_id = 2`)
+        // Revision B-cut (`rom_version = 1` -> `chip_id = 2`, `key_id = 0`)
         let Ok(assembled_b) = parse_and_assemble_rtl8821c(fw, Some(cfg), 1) else {
             assert!(false);
             return;
         };
         assert_eq!(assembled_b.chip_id, 2);
         assert_eq!(assembled_b.payload.len(), 21668 + cfg.len());
+
+        // When `key_id != 0`, Linux `btrtl_initialize` skips appending `rtl8821c_config.bin`.
+        let Ok(assembled_b_sec) = parse_and_assemble_rtl8821c_with_key(fw, Some(cfg), 1, 1) else {
+            assert!(false);
+            return;
+        };
+        assert_eq!(assembled_b_sec.payload.len(), 21668);
+
         let frags = assembled_b.fragment_count();
         assert_eq!(
             frags,
-            assembled_b.payload.len().div_ceil(RTL_DOWNLOAD_CHUNK_DATA)
+            assembled_b.payload.len() / RTL_DOWNLOAD_CHUNK_DATA + 1
         );
+        assert_eq!(frags, 87);
 
         let mut cmd_buf = [0u8; 260];
         let Some(first_len) = assembled_b.encode_download_cmd(0, &mut cmd_buf) else {
@@ -109,9 +151,127 @@ mod tests {
             assert!(false);
             return;
         };
-        assert!(last_len >= 4);
+        assert_eq!(
+            last_len,
+            4 + (assembled_b.payload.len() % RTL_DOWNLOAD_CHUNK_DATA)
+        );
         // Final fragment must carry end-of-patch bit 7 (`0x80`).
-        assert_ne!(cmd_buf[3] & 0x80, 0);
+        assert_eq!(cmd_buf[3], 86 | 0x80);
+
+        // Verify Linux `rtl_download_firmware` edge cases: exact multiple of 252 + `0x7F -> 1` wrap.
+        let mut big = Vec::new();
+        big.resize(130 * RTL_DOWNLOAD_CHUNK_DATA, 0x5Au8);
+        let synth = AssembledRtlFirmware {
+            fw_version: 1,
+            project_id: PROJECT_ID_8821C,
+            chip_id: 2,
+            payload: big,
+        };
+        assert_eq!(synth.fragment_count(), 131);
+        assert_eq!(synth.fragment_index_byte(0x7F), Some(0x7F));
+        assert_eq!(synth.fragment_index_byte(0x80), Some(0x01));
+        assert_eq!(synth.fragment_index_byte(0x81), Some(0x02));
+        assert_eq!(synth.fragment_index_byte(130), Some(0x03 | 0x80));
+        let Some(zero_tail_len) = synth.encode_download_cmd(130, &mut cmd_buf) else {
+            assert!(false);
+            return;
+        };
+        assert_eq!(zero_tail_len, 4);
+    }
+
+    #[test]
+    fn epatch_v2_and_btusb_stream_reassemblers_work_end_to_end() {
+        // Synthetic EPATCH v2 (`RTBTCore`) with out-of-order subsection priorities + tail TLV
+        let mut fw_v2 = Vec::new();
+        fw_v2.extend_from_slice(b"RTBTCore");
+        fw_v2.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        fw_v2.extend_from_slice(&[0u8; 4]);
+        fw_v2.extend_from_slice(&1u32.to_le_bytes()); // num_sections = 1
+                                                      // Section: opcode = 1 (`RTL_PATCH_SNIPPETS`), two subsecs for eco=2 (`rom_version=1`)
+        let mut sec = Vec::new();
+        sec.extend_from_slice(&2u16.to_le_bytes());
+        sec.extend_from_slice(&[0u8; 2]);
+        // Subsec A: eco=2, prio=2, key_id=0, len=3, data=[0xCC, 0xDD, 0xEE]
+        sec.extend_from_slice(&[2, 2, 0, 0]);
+        sec.extend_from_slice(&3u32.to_le_bytes());
+        sec.extend_from_slice(&[0xCC, 0xDD, 0xEE]);
+        // Subsec B: eco=2, prio=1, key_id=0, len=2, data=[0xAA, 0xBB]
+        sec.extend_from_slice(&[2, 1, 0, 0]);
+        sec.extend_from_slice(&2u32.to_le_bytes());
+        sec.extend_from_slice(&[0xAA, 0xBB]);
+
+        fw_v2.extend_from_slice(&1u32.to_le_bytes()); // opcode = SNIPPETS
+        fw_v2.extend_from_slice(&(sec.len() as u32).to_le_bytes());
+        fw_v2.extend_from_slice(&sec);
+        // Extension tail: [0x00, 0x00, 0xFF, PROJECT_ID_8821C, 0x01, 0x00, 0x51, 0x04, 0xFD, 0x77]
+        fw_v2.extend_from_slice(&[
+            0x00,
+            0x00,
+            0xFF,
+            PROJECT_ID_8821C,
+            0x01,
+            0x00,
+            0x51,
+            0x04,
+            0xFD,
+            0x77,
+        ]);
+
+        let Ok(parsed_v2) = parse_and_assemble_rtl8821c_with_key(&fw_v2, None, 1, 0) else {
+            assert!(false);
+            return;
+        };
+        assert_eq!(parsed_v2.fw_version, 0x1122_3344);
+        assert_eq!(parsed_v2.payload, alloc::vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+
+        // USB Interrupt IN fragmented + coalesced event reassembly
+        let mut evt_rx = BtUsbEvtReassembler::default();
+        // Split a 7-byte CommandComplete across two 4-byte + 3-byte chunks, followed by a coalesced pair
+        assert!(evt_rx.push_chunk(&[0x0E, 0x05, 0x01, 0x6D]).is_empty());
+        let done = evt_rx.push_chunk(&[0xFC, 0x00, 0x01]);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0],
+            alloc::vec![0x0E, 0x05, 0x01, 0x6D, 0xFC, 0x00, 0x01]
+        );
+
+        let coalesced = evt_rx.push_chunk(&[
+            0x0F, 0x04, 0x00, 0x01, 0x01, 0x04, // CommandStatus
+            0x01, 0x01, 0x00, // InquiryComplete
+        ]);
+        assert_eq!(coalesced.len(), 2);
+
+        // USB Bulk IN fragmented ACL reassembly
+        let mut acl_rx = BtUsbAclReassembler::default();
+        assert!(acl_rx.push_chunk(&[0x41, 0x20, 0x03]).is_empty());
+        let acl_done = acl_rx.push_chunk(&[0x00, 0x11, 0x22, 0x33]);
+        assert_eq!(acl_done.len(), 1);
+        assert_eq!(
+            acl_done[0],
+            alloc::vec![0x41, 0x20, 0x03, 0x00, 0x11, 0x22, 0x33]
+        );
+
+        // Columnar 2-response `EVT_INQUIRY_RESULT_RSSI` (`0x22`)
+        let mut multi = Vec::new();
+        multi.push(EVT_INQUIRY_RESULT_RSSI);
+        multi.push(1 + 2 * 14);
+        multi.push(2); // num_responses = 2
+        multi.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // BD_ADDR[0]
+        multi.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // BD_ADDR[1]
+        multi.extend_from_slice(&[0x01, 0x02]); // PSRM[0..2]
+        multi.extend_from_slice(&[0x00, 0x00]); // Reserved[0..2]
+        multi.extend_from_slice(&[0x18, 0x04, 0x24, 0x00, 0x00, 0x00]); // CoD[0], CoD[1]
+        multi.extend_from_slice(&[0x34, 0x12, 0x00, 0x00]); // ClockOffset[0..2]
+        multi.extend_from_slice(&[(-47i8) as u8, (-70i8) as u8]); // RSSI[0..2]
+        let Some(DecodedHciEvent::PeerDiscovered(peer)) = decode_event(&multi) else {
+            assert!(false);
+            return;
+        };
+        assert_eq!(peer.addr, BdAddr([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]));
+        assert_eq!(peer.page_scan_rep_mode, 0x01);
+        assert!(peer.advertises_a2dp_sink);
+        assert_eq!(peer.clock_offset, 0x1234);
+        assert_eq!(peer.rssi_dbm, -47);
     }
 
     #[test]

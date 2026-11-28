@@ -59,10 +59,13 @@ pub const BOT_DATA_OFF: usize = 0x0010_0000; // 1 MiB contiguous BOT data window
 pub const BOT_DATA_MAX_BYTES: usize = 0x0004_0000; // 256 KiB MDTS per request
 const BT_CMD_OUT_OFF: usize = 0x0020_0000; // 1 KiB HCI Control OUT buffer
 const BT_ACL_OUT_OFF: usize = 0x0020_0400; // 1 KiB HCI Bulk OUT ACL buffer
-const BT_EVT_IN_OFF: usize = 0x0020_0800; // 1 KiB HCI Interrupt IN Event buffer
-const BT_ACL_IN_OFF: usize = 0x0020_0C00; // 2 KiB HCI Bulk IN ACL buffer
-const BT_RX_FIFO_OFF: usize = 0x0021_0000; // 32 * 1056 B H4 RX ring in DMA pool
-const BT_RX_FIFO_SLOTS: usize = 32;
+const BT_EVT_IN_OFF: usize = 0x0020_1000; // 4 * 512 B HCI Interrupt IN Event buffers
+const BT_EVT_IN_STRIDE: usize = 0x0200;
+const BT_ACL_IN_OFF: usize = 0x0020_2000; // 4 * 2 KiB HCI Bulk IN ACL buffers
+const BT_ACL_IN_STRIDE: usize = 0x0800;
+const BT_IN_QUEUE_DEPTH: usize = 4;
+const BT_RX_FIFO_OFF: usize = 0x0021_0000; // 64 * 1056 B H4 RX ring in DMA pool
+const BT_RX_FIFO_SLOTS: usize = 64;
 const BT_RX_SLOT_STRIDE: usize = 1056;
 const BT_EVT_XFER_LEN: u16 = 260;
 const BT_ACL_XFER_LEN: u16 = 1028;
@@ -634,7 +637,7 @@ impl XhciController {
                 } => {
                     self.hw.borrow_mut().completed_trbs += 1;
                     if !self.try_handle_periodic_intr(slot_id, dci, code, residual_len, sink)
-                        && !self.try_handle_bt_async_rx(slot_id, dci, code, residual_len)
+                        && !self.try_handle_bt_async_rx(trb_iova, slot_id, dci, code, residual_len)
                     {
                         let _ = self.completions.complete_by_trb(
                             trb_iova,
@@ -908,6 +911,7 @@ impl XhciController {
 
     fn try_handle_bt_async_rx(
         &self,
+        trb_iova: u64,
         slot_id: u8,
         dci: u8,
         code: CompletionCode,
@@ -917,20 +921,48 @@ impl XhciController {
             return false;
         }
         let d_idx = usize::from(slot_id - 1);
-        let (is_evt, ring_idx, src_off, xfer_len) = {
+        let (is_evt, ring_idx, base_off, stride, xfer_len) = {
             let hw = self.hw.borrow();
             let dev = &hw.devices[d_idx];
             if !dev.active || !dev.bt.active {
                 return false;
             }
             if dci == dev.bt.evt_in_dci {
-                (true, dev.bt.evt_in_ring, BT_EVT_IN_OFF, BT_EVT_XFER_LEN)
+                (
+                    true,
+                    dev.bt.evt_in_ring,
+                    BT_EVT_IN_OFF,
+                    BT_EVT_IN_STRIDE,
+                    BT_EVT_XFER_LEN,
+                )
             } else if dci == dev.bt.acl_in_dci {
-                (false, dev.bt.acl_in_ring, BT_ACL_IN_OFF, BT_ACL_XFER_LEN)
+                (
+                    false,
+                    dev.bt.acl_in_ring,
+                    BT_ACL_IN_OFF,
+                    BT_ACL_IN_STRIDE,
+                    BT_ACL_XFER_LEN,
+                )
             } else {
                 return false;
             }
         };
+
+        let mut src_off = base_off;
+        if trb_iova >= self.dma_phys {
+            let trb_off = (trb_iova - self.dma_phys) as usize;
+            if trb_off + 8 <= MIN_DMA_POOL_BYTES {
+                let mut param_le = [0u8; 8];
+                self.dma.copy_out(trb_off, &mut param_le);
+                let buf_phys = u64::from_le_bytes(param_le);
+                if buf_phys >= self.dma_phys {
+                    let cand = (buf_phys - self.dma_phys) as usize;
+                    if cand >= base_off && cand < base_off + BT_IN_QUEUE_DEPTH * stride {
+                        src_off = cand;
+                    }
+                }
+            }
+        }
 
         if code.is_ok() {
             let actual = usize::from(xfer_len)
@@ -1889,20 +1921,24 @@ impl XhciController {
             self.arm_interrupt_pipe(slot_id, intr1_pipe);
         }
         if bt_state.active {
-            self.arm_bt_rx_pipe(
-                slot_id,
-                bt_state.evt_in_dci,
-                bt_state.evt_in_ring,
-                BT_EVT_IN_OFF,
-                BT_EVT_XFER_LEN,
-            );
-            self.arm_bt_rx_pipe(
-                slot_id,
-                bt_state.acl_in_dci,
-                bt_state.acl_in_ring,
-                BT_ACL_IN_OFF,
-                BT_ACL_XFER_LEN,
-            );
+            let mut q = 0usize;
+            while q < BT_IN_QUEUE_DEPTH {
+                self.arm_bt_rx_pipe(
+                    slot_id,
+                    bt_state.evt_in_dci,
+                    bt_state.evt_in_ring,
+                    BT_EVT_IN_OFF + q * BT_EVT_IN_STRIDE,
+                    BT_EVT_XFER_LEN,
+                );
+                self.arm_bt_rx_pipe(
+                    slot_id,
+                    bt_state.acl_in_dci,
+                    bt_state.acl_in_ring,
+                    BT_ACL_IN_OFF + q * BT_ACL_IN_STRIDE,
+                    BT_ACL_XFER_LEN,
+                );
+                q += 1;
+            }
         }
         Ok(())
     }

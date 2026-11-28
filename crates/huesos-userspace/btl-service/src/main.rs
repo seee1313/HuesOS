@@ -38,21 +38,24 @@ use huesos_abi::btl::{
 };
 use huesos_abi::wlan::{self, BtCoexProfile, WlanOp, WlanStatus};
 use huesos_bt::btrtl::{
-    cmd_read_rom_version, is_rtl8821ce_usb_id, parse_and_assemble_rtl8821c,
-    parse_rom_version_return, LMP_SUBVER_8821C, OP_RTL_DOWNLOAD, OP_RTL_READ_ROM_VERSION,
-    REALTEK_MANUFACTURER_ID,
+    cmd_drop_firmware, cmd_read_rom_version, cmd_vendor_read_reg16, is_rtl8821ce_usb_id,
+    matches_rtl8821c_rom, parse_and_assemble_rtl8821c_with_key, parse_reg16_return,
+    parse_rom_version_return, OP_RTL_DOWNLOAD, OP_RTL_READ_REG16, OP_RTL_READ_ROM_VERSION,
+    REALTEK_MANUFACTURER_ID, RTL_REG_CHIP_SUBVER, RTL_REG_SEC_PROJ,
 };
 use huesos_bt::hci::{
     cmd_accept_connection, cmd_authentication_requested, cmd_create_connection, cmd_disconnect,
     cmd_inquiry_giac, cmd_io_capability_reply_just_works, cmd_link_key_neg_reply,
     cmd_link_key_reply, cmd_pin_code_reply, cmd_read_bd_addr, cmd_read_buffer_size,
-    cmd_read_local_version, cmd_remote_name_request, cmd_reset, cmd_set_encryption,
-    cmd_set_event_mask_ssp, cmd_user_confirmation_reply, cmd_write_class_of_device,
-    cmd_write_default_link_policy, cmd_write_inquiry_mode, cmd_write_local_name,
-    cmd_write_page_timeout, cmd_write_scan_enable, cmd_write_simple_pairing_mode, decode_event,
-    parse_buffer_size_return, parse_local_version_return, segment_l2cap_to_acl, AclCreditTracker,
-    AclReassembler, BdAddr, DecodedHciEvent, DiscoveredPeer, LinkKey, H4_ACL, H4_CMD, H4_EVT,
-    LOCAL_COD_COMPUTER_AUDIO_SOURCE, OP_READ_BD_ADDR, OP_READ_BUFFER_SIZE, OP_READ_LOCAL_VERSION,
+    cmd_read_local_features, cmd_read_local_version, cmd_remote_name_request,
+    cmd_remote_name_request_cancel, cmd_reset, cmd_set_encryption, cmd_set_event_mask_ssp,
+    cmd_user_confirmation_reply, cmd_write_class_of_device, cmd_write_default_link_policy,
+    cmd_write_inquiry_mode, cmd_write_local_name, cmd_write_page_timeout, cmd_write_scan_enable,
+    cmd_write_simple_pairing_mode, decode_event, parse_buffer_size_return,
+    parse_local_version_return, segment_l2cap_to_acl, AclCreditTracker, AclReassembler, BdAddr,
+    BtUsbAclReassembler, BtUsbEvtReassembler, DecodedHciEvent, DiscoveredPeer, LinkKey, H4_ACL,
+    H4_CMD, H4_EVT, LOCAL_COD_COMPUTER_AUDIO_SOURCE, OP_INQUIRY, OP_READ_BD_ADDR,
+    OP_READ_BUFFER_SIZE, OP_READ_LOCAL_FEATURES, OP_READ_LOCAL_VERSION, OP_REMOTE_NAME_REQ_CANCEL,
 };
 use huesos_bt::l2cap::{L2capEngine, L2capEvent, PSM_AVCTP, PSM_AVDTP, PSM_SDP};
 use huesos_bt::sdp::{
@@ -542,16 +545,21 @@ struct BtlRuntime {
 
     transport: BtlTransportKind,
     powered: bool,
+    user_forced_off: bool,
     firmware_loaded: bool,
     usb_vid: u16,
     usb_pid: u16,
     local_bd_addr: BdAddr,
     fw_version: u32,
+    local_hci_ver: u8,
+    local_hci_rev: u16,
     local_manufacturer: u16,
     local_lmp_subver: u16,
     rom_version: Option<u8>,
 
     virtual_bt: Option<VirtualBtMedium>,
+    usb_evt_rx: BtUsbEvtReassembler,
+    usb_acl_rx: BtUsbAclReassembler,
     credits: AclCreditTracker,
     l2cap: L2capEngine,
     snoop: BtSnoopLog,
@@ -571,7 +579,11 @@ struct BtlRuntime {
     next_sdp_tid: u16,
 
     last_cmd_complete: Option<(u16, u8)>,
+    last_cmd_return: [u8; 32],
+    last_cmd_return_len: usize,
     last_pairing_status: Option<(BdAddr, u8)>,
+    last_remote_name_done: Option<BdAddr>,
+    last_auto_probe_ms: u64,
 }
 
 impl BtlRuntime {
@@ -583,15 +595,20 @@ impl BtlRuntime {
             wlan_coex_ch: None,
             transport: BtlTransportKind::Absent,
             powered: false,
+            user_forced_off: false,
             firmware_loaded: false,
             usb_vid: 0,
             usb_pid: 0,
             local_bd_addr: BdAddr::ZERO,
             fw_version: 0,
+            local_hci_ver: 0,
+            local_hci_rev: 0,
             local_manufacturer: 0,
             local_lmp_subver: 0,
             rom_version: None,
             virtual_bt: None,
+            usb_evt_rx: BtUsbEvtReassembler::default(),
+            usb_acl_rx: BtUsbAclReassembler::default(),
             credits: AclCreditTracker::default(),
             l2cap: L2capEngine::new(),
             snoop: BtSnoopLog::new(64 * 1024),
@@ -608,7 +625,11 @@ impl BtlRuntime {
             streaming_hint_active: false,
             next_sdp_tid: 1,
             last_cmd_complete: None,
+            last_cmd_return: [0u8; 32],
+            last_cmd_return_len: 0,
             last_pairing_status: None,
+            last_remote_name_done: None,
+            last_auto_probe_ms: 0,
         }
     }
 
@@ -748,13 +769,32 @@ impl BtlRuntime {
         }
     }
 
+    fn drain_usb_rx(&mut self) {
+        self.usb_evt_rx.reset();
+        self.usb_acl_rx.reset();
+        let Some(ch) = self.usb_bt_ch.as_ref() else {
+            return;
+        };
+        let mut rep = [0u8; 1064];
+        for _ in 0..64u32 {
+            let Some(n) = usb_bt_rpc(ch, UsbBtOp::PollRx, &[], &mut rep) else {
+                break;
+            };
+            if n <= 8 || rep[7] != 0 {
+                break;
+            }
+        }
+    }
+
     fn send_cmd_wait(&mut self, opcode: u16, cmd: &[u8], timeout_ms: u64) -> Option<u8> {
         self.last_cmd_complete = None;
+        self.last_cmd_return_len = 0;
         if !self.send_hci_cmd(cmd) {
             return None;
         }
         let deadline = monotonic_ms().saturating_add(timeout_ms);
-        for _budget in 0..512u32 {
+        let mut spins = 0u32;
+        for _budget in 0..4096u32 {
             self.pump_transport(16);
             if let Some((done_op, status)) = self.last_cmd_complete {
                 if done_op == opcode {
@@ -765,7 +805,12 @@ impl BtlRuntime {
             if monotonic_ms() >= deadline {
                 break;
             }
-            libcanvas::system::sleep_ms(1);
+            if spins < 12 {
+                spins += 1;
+                libcanvas::process::yield_now();
+            } else {
+                libcanvas::system::sleep_ms(1);
+            }
         }
         None
     }
@@ -811,9 +856,15 @@ impl BtlRuntime {
                     let h4_type = rep[8];
                     let body = &rep[9..n];
                     if h4_type == H4_EVT {
-                        self.on_hci_event(body);
+                        let events = self.usb_evt_rx.push_chunk(body);
+                        for evt in events {
+                            self.on_hci_event(&evt);
+                        }
                     } else if h4_type == H4_ACL {
-                        self.on_hci_acl(body);
+                        let acls = self.usb_acl_rx.push_chunk(body);
+                        for acl in acls {
+                            self.on_hci_acl(&acl);
+                        }
                     }
                 }
             }
@@ -841,10 +892,15 @@ impl BtlRuntime {
                 ..
             } => {
                 self.last_cmd_complete = Some((opcode, status));
+                let copy_len = return_params.len().min(self.last_cmd_return.len());
+                self.last_cmd_return[..copy_len].copy_from_slice(&return_params[..copy_len]);
+                self.last_cmd_return_len = copy_len;
                 if status == 0 {
                     match opcode {
                         OP_READ_LOCAL_VERSION => {
                             if let Some(ver) = parse_local_version_return(return_params) {
+                                self.local_hci_ver = ver.hci_ver;
+                                self.local_hci_rev = ver.hci_rev;
                                 self.local_manufacturer = ver.manufacturer;
                                 self.local_lmp_subver = ver.lmp_subver;
                             }
@@ -899,6 +955,7 @@ impl BtlRuntime {
                 name,
                 name_len,
             } => {
+                self.last_remote_name_done = Some(addr);
                 if status == 0 && name_len > 0 {
                     if let Some(existing) = self.peers.iter_mut().find(|p| p.addr == addr) {
                         existing.name = name;
@@ -1132,16 +1189,27 @@ impl BtlRuntime {
 
     // ---- Controller Bring-up (`RTL8821CE` `btrtl` + Standard HCI) ----
 
-    fn bring_up_usb_controller(&mut self) -> Result<(), BtlStatus> {
-        let Some(ch) = self.usb_bt_ch.as_ref() else {
-            return Err(BtlStatus::HardwareAbsent);
-        };
-        let Some(info) = usb_bt_query(ch) else {
-            return Err(BtlStatus::HardwareAbsent);
-        };
-        if !info.present {
-            return Err(BtlStatus::HardwareAbsent);
+    fn wait_usb_bt_present(&self, timeout_ms: u64) -> Option<UsbBtControllerInfo> {
+        let ch = self.usb_bt_ch.as_ref()?;
+        let deadline = monotonic_ms().saturating_add(timeout_ms);
+        for _budget in 0..256u32 {
+            if let Some(info) = usb_bt_query(ch) {
+                if info.present {
+                    return Some(info);
+                }
+            }
+            if monotonic_ms() >= deadline {
+                break;
+            }
+            libcanvas::system::sleep_ms(25);
         }
+        None
+    }
+
+    fn bring_up_usb_controller(&mut self) -> Result<(), BtlStatus> {
+        let Some(info) = self.wait_usb_bt_present(300) else {
+            return Err(BtlStatus::HardwareAbsent);
+        };
 
         let is_rtk = info.is_realtek || is_rtl8821ce_usb_id(info.vid, info.pid);
         self.transport = if is_rtk {
@@ -1153,25 +1221,94 @@ impl BtlRuntime {
         self.usb_pid = info.pid;
         self.virtual_bt = None;
         self.credits = AclCreditTracker::default();
+        self.drain_usb_rx();
 
         let mut cmd = [0u8; 264];
-        if let Some(n) = cmd_read_local_version(&mut cmd) {
-            if self.send_cmd_wait(OP_READ_LOCAL_VERSION, &cmd[..n], 500) != Some(0) {
-                return Err(BtlStatus::HardwareAbsent);
-            }
-        }
 
-        if is_rtk
-            && (self.local_manufacturer == REALTEK_MANUFACTURER_ID || self.local_manufacturer == 0)
-        {
-            if self.local_lmp_subver == LMP_SUBVER_8821C {
-                let rom_ver = if let Some(n) = cmd_read_rom_version(&mut cmd) {
-                    let _ = self.send_cmd_wait(OP_RTL_READ_ROM_VERSION, &cmd[..n], 400);
-                    self.rom_version.unwrap_or(1)
-                } else {
-                    1
+        if is_rtk {
+            // Exact Linux `btrtl_initialize` + `btrtl_setup_realtek` (`drivers/bluetooth/btrtl.c`).
+            let mut in_rom = false;
+            for attempt in 0..2u8 {
+                if let Some(n) = cmd_vendor_read_reg16(&RTL_REG_CHIP_SUBVER, &mut cmd) {
+                    let _ = self.send_cmd_wait(OP_RTL_READ_REG16, &cmd[..n], 400);
+                }
+                let Some(n) = cmd_read_local_version(&mut cmd) else {
+                    return Err(BtlStatus::HardwareAbsent);
                 };
+                if self.send_cmd_wait(OP_READ_LOCAL_VERSION, &cmd[..n], 1_000) != Some(0) {
+                    println!("[btl-service] RTL8821CE Read_Local_Version (0x1001) timed out");
+                    return Err(BtlStatus::HardwareAbsent);
+                }
+                println!(
+                    "[btl-service] RTL8821CE local version (attempt {}): hci_ver=0x{:02x} hci_rev=0x{:04x} lmp_subver=0x{:04x} mfg=0x{:04x}",
+                    attempt,
+                    self.local_hci_ver,
+                    self.local_hci_rev,
+                    self.local_lmp_subver,
+                    self.local_manufacturer
+                );
+
+                if matches_rtl8821c_rom(
+                    self.local_lmp_subver,
+                    self.local_hci_rev,
+                    self.local_hci_ver,
+                ) {
+                    in_rom = true;
+                    break;
+                }
+
+                // Warm-boot case (`btrtl.c:942`): controller already has RAM firmware loaded from
+                // host OS; send `0xFC66` (`drop_fw`) without waiting for CommandComplete, sleep
+                // `200 ms`, re-verify USB presence, and retry `check_version`.
+                if attempt == 0 {
+                    println!(
+                        "[btl-service] RTL8821CE running warm firmware (lmp_subver=0x{:04x}), issuing 0xFC66 drop_fw",
+                        self.local_lmp_subver
+                    );
+                    if let Some(dn) = cmd_drop_firmware(&mut cmd) {
+                        let _ = self.send_hci_cmd(&cmd[..dn]);
+                    }
+                    libcanvas::system::sleep_ms(200);
+                    let _ = self.wait_usb_bt_present(1_500);
+                    self.drain_usb_rx();
+                }
+            }
+
+            if in_rom
+                && (self.local_manufacturer == REALTEK_MANUFACTURER_ID
+                    || self.local_manufacturer == 0)
+            {
+                self.rom_version = None;
+                let rom_ver = if let Some(n) = cmd_read_rom_version(&mut cmd) {
+                    if self.send_cmd_wait(OP_RTL_READ_ROM_VERSION, &cmd[..n], 500) == Some(0) {
+                        self.rom_version.unwrap_or(0)
+                    } else {
+                        println!("[btl-service] 0xFC6D Read_ROM_Version failed, defaulting to 0");
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                let mut key_id = 0u8;
+                if let Some(n) = cmd_vendor_read_reg16(&RTL_REG_SEC_PROJ, &mut cmd) {
+                    if self.send_cmd_wait(OP_RTL_READ_REG16, &cmd[..n], 400) == Some(0) {
+                        if let Some(reg) =
+                            parse_reg16_return(&self.last_cmd_return[..self.last_cmd_return_len])
+                        {
+                            key_id = reg[0];
+                        }
+                    }
+                }
+                println!(
+                    "[btl-service] RTL8821CE rom_version=0x{:02x} key_id={} (target chip_id={})",
+                    rom_ver,
+                    key_id,
+                    u16::from(rom_ver).saturating_add(1)
+                );
+
                 let Some(bootfs) = self.bootfs_vmo.as_ref() else {
+                    println!("[btl-service] missing bootfs-vmo handle");
                     return Err(BtlStatus::FirmwareFailed);
                 };
                 let Some(fw_bytes) = read_bootfs_file(bootfs, RTL_FW_PATH) else {
@@ -1179,48 +1316,76 @@ impl BtlRuntime {
                     return Err(BtlStatus::FirmwareFailed);
                 };
                 let cfg_bytes = read_bootfs_file(bootfs, RTL_CFG_PATH);
-                let Ok(assembled) =
-                    parse_and_assemble_rtl8821c(&fw_bytes, cfg_bytes.as_deref(), rom_ver)
-                else {
-                    println!("[btl-service] invalid RTL8821CE firmware image");
-                    return Err(BtlStatus::FirmwareFailed);
+                let assembled = match parse_and_assemble_rtl8821c_with_key(
+                    &fw_bytes,
+                    cfg_bytes.as_deref(),
+                    rom_ver,
+                    key_id,
+                ) {
+                    Ok(a) => a,
+                    Err(err) => {
+                        println!(
+                            "[btl-service] RTL8821CE firmware parse error {:?} (rom_ver={})",
+                            err, rom_ver
+                        );
+                        return Err(BtlStatus::FirmwareFailed);
+                    }
                 };
+
                 let total_frags = assembled.fragment_count();
                 for frag_idx in 0..total_frags {
                     let Some(clen) = assembled.encode_download_cmd(frag_idx, &mut cmd) else {
                         return Err(BtlStatus::FirmwareFailed);
                     };
-                    if self.send_cmd_wait(OP_RTL_DOWNLOAD, &cmd[..clen], 500) != Some(0) {
+                    let expected_idx = cmd[3];
+                    if self.send_cmd_wait(OP_RTL_DOWNLOAD, &cmd[..clen], 1_000) != Some(0) {
                         println!(
-                            "[btl-service] RTL8821CE patch upload failed at frag {}/{}",
+                            "[btl-service] RTL8821CE 0xFC20 upload failed at frag {}/{}",
                             frag_idx, total_frags
                         );
                         return Err(BtlStatus::FirmwareFailed);
                     }
+                    if self.last_cmd_return_len >= 1
+                        && (self.last_cmd_return[0] & 0x7F) != (expected_idx & 0x7F)
+                    {
+                        println!(
+                            "[btl-service] RTL8821CE 0xFC20 index mismatch got=0x{:02x} exp=0x{:02x}",
+                            self.last_cmd_return[0], expected_idx
+                        );
+                        return Err(BtlStatus::FirmwareFailed);
+                    }
+                }
+
+                // Post-upload `rtl_read_local_version` verification (`btrtl.c:630`) + settle.
+                libcanvas::system::sleep_ms(30);
+                if let Some(n) = cmd_read_local_version(&mut cmd) {
+                    let _ = self.send_cmd_wait(OP_READ_LOCAL_VERSION, &cmd[..n], 1_000);
                 }
                 self.fw_version = assembled.fw_version;
                 self.firmware_loaded = true;
                 println!(
-                    "[btl-service] uploaded RTL8821CE Bluetooth patch ({} B, {} frags, fw=0x{:08x})",
+                    "[btl-service] RTL8821CE patch active ({} B, {} frags, epatch=0x{:08x}, post_rev=0x{:04x}:0x{:04x})",
                     assembled.payload.len(),
                     total_frags,
-                    self.fw_version
+                    self.fw_version,
+                    self.local_hci_rev,
+                    self.local_lmp_subver
                 );
             } else {
-                // Controller already warm-patched across warm reset
+                // Controller remained in functional warm-patched mode
                 self.firmware_loaded = true;
-                self.fw_version = if let Some(bootfs) = self.bootfs_vmo.as_ref() {
-                    read_bootfs_file(bootfs, RTL_FW_PATH)
-                        .filter(|b| b.len() >= 12)
-                        .map(|b| u32::from_le_bytes([b[8], b[9], b[10], b[11]]))
-                        .unwrap_or(u32::from(self.local_lmp_subver))
-                } else {
-                    u32::from(self.local_lmp_subver)
-                };
+                self.fw_version =
+                    (u32::from(self.local_hci_rev) << 16) | u32::from(self.local_lmp_subver);
             }
         } else {
+            if let Some(n) = cmd_read_local_version(&mut cmd) {
+                if self.send_cmd_wait(OP_READ_LOCAL_VERSION, &cmd[..n], 1_000) != Some(0) {
+                    return Err(BtlStatus::HardwareAbsent);
+                }
+            }
             self.firmware_loaded = true;
-            self.fw_version = u32::from(self.local_lmp_subver);
+            self.fw_version =
+                (u32::from(self.local_hci_rev) << 16) | u32::from(self.local_lmp_subver);
         }
 
         self.run_standard_hci_init()
@@ -1240,45 +1405,57 @@ impl BtlRuntime {
     fn run_standard_hci_init(&mut self) -> Result<(), BtlStatus> {
         let mut cmd = [0u8; 260];
         if let Some(n) = cmd_reset(&mut cmd) {
-            if self.send_cmd_wait(0x0C03, &cmd[..n], 500) != Some(0) {
+            if self.send_cmd_wait(0x0C03, &cmd[..n], 2_000) != Some(0) {
+                println!("[btl-service] HCI_Reset (0x0C03) failed");
                 return Err(BtlStatus::HardwareAbsent);
             }
         }
+        if let Some(n) = cmd_read_local_features(&mut cmd) {
+            let _ = self.send_cmd_wait(OP_READ_LOCAL_FEATURES, &cmd[..n], 500);
+        }
         if let Some(n) = cmd_read_local_version(&mut cmd) {
-            let _ = self.send_cmd_wait(OP_READ_LOCAL_VERSION, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(OP_READ_LOCAL_VERSION, &cmd[..n], 500);
         }
         if let Some(n) = cmd_read_bd_addr(&mut cmd) {
-            let _ = self.send_cmd_wait(OP_READ_BD_ADDR, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(OP_READ_BD_ADDR, &cmd[..n], 500);
         }
         if let Some(n) = cmd_read_buffer_size(&mut cmd) {
-            let _ = self.send_cmd_wait(OP_READ_BUFFER_SIZE, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(OP_READ_BUFFER_SIZE, &cmd[..n], 500);
         }
         if let Some(n) = cmd_set_event_mask_ssp(&mut cmd) {
-            let _ = self.send_cmd_wait(0x0C01, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(0x0C01, &cmd[..n], 500);
         }
         if let Some(n) = cmd_write_simple_pairing_mode(true, &mut cmd) {
-            let _ = self.send_cmd_wait(0x0C56, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(0x0C56, &cmd[..n], 500);
         }
         if let Some(n) = cmd_write_inquiry_mode(2, &mut cmd) {
-            let _ = self.send_cmd_wait(0x0C45, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(0x0C45, &cmd[..n], 500);
         }
         if let Some(n) = cmd_write_class_of_device(LOCAL_COD_COMPUTER_AUDIO_SOURCE, &mut cmd) {
-            let _ = self.send_cmd_wait(0x0C24, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(0x0C24, &cmd[..n], 500);
         }
         if let Some(n) = cmd_write_local_name("HuesOS Workstation", &mut cmd) {
-            let _ = self.send_cmd_wait(0x0C13, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(0x0C13, &cmd[..n], 500);
         }
         if let Some(n) = cmd_write_page_timeout(0x2000, &mut cmd) {
-            let _ = self.send_cmd_wait(0x0C18, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(0x0C18, &cmd[..n], 500);
         }
         if let Some(n) = cmd_write_default_link_policy(0x0005, &mut cmd) {
-            let _ = self.send_cmd_wait(0x080F, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(0x080F, &cmd[..n], 500);
         }
         if let Some(n) = cmd_write_scan_enable(0x03, &mut cmd) {
-            let _ = self.send_cmd_wait(0x0C1A, &cmd[..n], 300);
+            let _ = self.send_cmd_wait(0x0C1A, &cmd[..n], 500);
         }
         self.powered = true;
+        self.user_forced_off = false;
         self.sync_coex_profile();
+        let mut addr_txt = [0u8; 17];
+        self.local_bd_addr.format_ascii(&mut addr_txt);
+        let addr_str = core::str::from_utf8(&addr_txt).unwrap_or("00:00:00:00:00:00");
+        println!(
+            "[btl-service] HCI controller online bd_addr={} acl_mtu={} slots={}",
+            addr_str, self.credits.max_acl_len, self.credits.total_credits
+        );
         Ok(())
     }
 
@@ -1295,6 +1472,7 @@ impl BtlRuntime {
         self.endpoints.clear();
         self.credits.reset_in_flight();
         self.powered = false;
+        self.user_forced_off = true;
         self.scanning = false;
         self.pairing_in_progress = false;
         self.streaming_hint_active = false;
@@ -1304,6 +1482,9 @@ impl BtlRuntime {
     // ---- High-level HCI / L2CAP / SDP Operations ----
 
     fn run_inquiry_scan(&mut self, duration_units: u8) -> Result<(), BtlStatus> {
+        if !self.powered && !self.user_forced_off && self.usb_bt_ch.is_some() {
+            let _ = self.bring_up_usb_controller();
+        }
         if !self.powered || self.transport == BtlTransportKind::Absent {
             return Err(BtlStatus::HardwareAbsent);
         }
@@ -1312,6 +1493,7 @@ impl BtlRuntime {
         let Some(n) = cmd_inquiry_giac(units, 16, &mut cmd) else {
             return Err(BtlStatus::InvalidRequest);
         };
+        self.last_cmd_complete = None;
         self.scanning = true;
         self.sync_coex_profile();
         if !self.send_hci_cmd(&cmd[..n]) {
@@ -1322,11 +1504,18 @@ impl BtlRuntime {
         let wait_ms = if self.transport == BtlTransportKind::VirtualLoopback {
             50
         } else {
-            u64::from(units).saturating_mul(1350).saturating_add(300)
+            u64::from(units).saturating_mul(1350).saturating_add(400)
         };
         let deadline = monotonic_ms().saturating_add(wait_ms);
-        for _budget in 0..2048u32 {
+        for _budget in 0..4096u32 {
             self.pump_transport(16);
+            if let Some((OP_INQUIRY, st)) = self.last_cmd_complete {
+                if st != 0 {
+                    self.last_cmd_complete = None;
+                    self.scanning = false;
+                    break;
+                }
+            }
             if !self.scanning || monotonic_ms() >= deadline {
                 break;
             }
@@ -1343,16 +1532,28 @@ impl BtlRuntime {
             .collect();
         for (addr, psrm, clk) in unnamed {
             if let Some(rn_len) = cmd_remote_name_request(addr, psrm, clk, &mut cmd) {
+                self.last_remote_name_done = None;
                 if self.send_hci_cmd(&cmd[..rn_len]) {
-                    let rn_deadline = monotonic_ms().saturating_add(400);
-                    for _budget in 0..128u32 {
+                    let rn_deadline = monotonic_ms().saturating_add(1_200);
+                    let mut finished = false;
+                    for _budget in 0..512u32 {
                         self.pump_transport(8);
-                        if self.peers.iter().any(|p| p.addr == addr && p.name_len > 0)
-                            || monotonic_ms() >= rn_deadline
+                        if self.last_remote_name_done == Some(addr)
+                            || self.peers.iter().any(|p| p.addr == addr && p.name_len > 0)
                         {
+                            finished = true;
                             break;
                         }
-                        libcanvas::system::sleep_ms(4);
+                        if monotonic_ms() >= rn_deadline {
+                            break;
+                        }
+                        libcanvas::system::sleep_ms(5);
+                    }
+                    if !finished {
+                        if let Some(cn_len) = cmd_remote_name_request_cancel(addr, &mut cmd) {
+                            let _ =
+                                self.send_cmd_wait(OP_REMOTE_NAME_REQ_CANCEL, &cmd[..cn_len], 150);
+                        }
                     }
                 }
             }
@@ -1361,7 +1562,24 @@ impl BtlRuntime {
         Ok(())
     }
 
+    fn maybe_auto_bring_up_usb(&mut self) {
+        if self.powered
+            || self.user_forced_off
+            || self.transport == BtlTransportKind::VirtualLoopback
+            || self.usb_bt_ch.is_none()
+        {
+            return;
+        }
+        let now = monotonic_ms();
+        if self.last_auto_probe_ms != 0 && now.saturating_sub(self.last_auto_probe_ms) < 3_000 {
+            return;
+        }
+        self.last_auto_probe_ms = now.max(1);
+        let _ = self.bring_up_usb_controller();
+    }
+
     fn ensure_acl_connected(&mut self, addr: BdAddr) -> Result<(u16, bool), BtlStatus> {
+        self.maybe_auto_bring_up_usb();
         if !self.powered || self.transport == BtlTransportKind::Absent {
             return Err(BtlStatus::HardwareAbsent);
         }
@@ -1527,6 +1745,7 @@ impl BtlRuntime {
 
         match op {
             BtlOp::Status => {
+                self.maybe_auto_bring_up_usb();
                 let snoop_len = self.snoop.export_bytes().len() as u32;
                 let open_cids = self.endpoints.iter().filter(|e| e.open).count() as u8;
                 let snap = BtlStatusSnapshot {
@@ -2234,10 +2453,20 @@ fn accept_bootstrap_handle(
 ) {
     if tag == b"bootfs-vmo" || tag == b"bootfs:vmo" {
         rt.bootfs_vmo = Some(Vmo::from_handle(handle));
+        if rt.usb_bt_ch.is_some() && !rt.powered && !rt.user_forced_off {
+            if rt.bring_up_usb_controller().is_ok() {
+                println!(
+                    "[btl-service] attached USB Bluetooth HCI ({:04x}:{:04x})",
+                    rt.usb_vid, rt.usb_pid
+                );
+            }
+        }
     } else if tag == b"usb-bt-hci" {
         rt.usb_bt_ch = Some(Channel::from_handle(handle));
-        if rt.transport == BtlTransportKind::Absent
+        if (rt.transport == BtlTransportKind::Absent
             || rt.transport == BtlTransportKind::VirtualLoopback
+            || !rt.powered)
+            && !rt.user_forced_off
         {
             if rt.bring_up_usb_controller().is_ok() {
                 println!(
