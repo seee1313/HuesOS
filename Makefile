@@ -57,42 +57,7 @@ run-test-release: iso-test-release
 	bash scripts/run.sh release
 
 test:
-	# The 16 MiB host test mounts a writer with an 8192-extent fixed
-	# array on the stack; the default test-thread stack overflows
-	# when the hxblob index field is also present. 16 MiB is enough.
-	RUST_MIN_STACK=16777216 cargo test -p huesos-abi -p huesos-arch -p huesos-sync -p huesos-elf -p huesos-pmm -p huesos-object -p huesos-fb \
-		-p huesos-syscalls -p huesos-fat -p huesos-alloc -p huesos-uacpi -p huesos-kernel \
-		-p huesos-scudo \
-		-p huesos-scudo-fuzz \
-		-p huesos-blobfs \
-		-p huesos-bootux \
-		-p huesos-lifecycle \
-		-p huesos-sched \
-		-p huesos-iommu \
-		-p huesos-ioapic \
-		-p huesos-extable \
-		-p huesos-waitset \
-		-p huesos-proclife \
-		-p huesos-handlemove \
-		-p hues-async \
-		-p huesos-nvme \
-		-p huesos-usb \
-		-p huesos-hxfs \
-		-p huesos-hxfs-proto \
-		-p huesos-pci \
-		-p huesos-quota \
-		-p huesos-tpm \
-		-p huesos-hsh \
-		-p huesos-gpt \
-		-p huesos-pe \
-		-p huesos-net \
-		-p huesos-ieee80211 \
-		-p huesos-wpa \
-		-p huesos-rtw88 \
-		-p huesos-tls \
-		-p huesos-bt \
-		-p huesos-audio \
-		--target x86_64-unknown-linux-gnu
+	bash scripts/test-host.sh
 
 # The ordinary host suite builds huesos-hxfs without optional engines. This
 # second gate is the production storage composition used by the encrypted
