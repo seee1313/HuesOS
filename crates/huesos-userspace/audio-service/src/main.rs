@@ -185,6 +185,14 @@ fn btl_rpc(
     if 8 + payload.len() > 1100 {
         return Err(BtlStatus::InvalidRequest);
     }
+    // Drain any stale reply left by an earlier timed-out RPC so framing stays synchronized.
+    let mut stale = [0u8; 1100];
+    for _drain in 0..8u32 {
+        if ch.read_into(&mut stale).is_err() {
+            break;
+        }
+    }
+
     let mut req = [0u8; 1100];
     btl::write_header(&mut req, op, BtlStatus::Ok);
     req[8..8 + payload.len()].copy_from_slice(payload);
@@ -201,6 +209,9 @@ fn btl_rpc(
     for _budget in 0..2048u32 {
         match ch.read_into(out) {
             Ok(n) => {
+                if n >= 8 && out[6] != (op as u8) {
+                    continue;
+                }
                 let st = btl::check_header(&out[..n], op)?;
                 if st == BtlStatus::Ok {
                     return Ok(n);
@@ -246,7 +257,7 @@ fn btl_l2cap_send(ch: &Channel, cid: u16, sdu: &[u8]) -> Result<(u16, u8), BtlSt
         ch,
         BtlOp::L2capSend,
         &payload[..4 + sdu.len()],
-        300,
+        800,
         &mut rep,
     )?;
     if n < 12 {
@@ -263,7 +274,7 @@ fn btl_l2cap_recv(ch: &Channel, cid: u16, out_sdu: &mut [u8]) -> Result<usize, B
     payload[0..2].copy_from_slice(&cid.to_le_bytes());
     payload[2..4].copy_from_slice(&max_want.to_le_bytes());
     let mut rep = [0u8; 1100];
-    let n = btl_rpc(ch, BtlOp::L2capRecv, &payload, 50, &mut rep)?;
+    let n = btl_rpc(ch, BtlOp::L2capRecv, &payload, 250, &mut rep)?;
     if n < 12 {
         return Err(BtlStatus::InvalidRequest);
     }
@@ -275,14 +286,14 @@ fn btl_l2cap_recv(ch: &Channel, cid: u16, out_sdu: &mut [u8]) -> Result<usize, B
     Ok(dlen)
 }
 
-fn btl_l2cap_listen(ch: &Channel, psm: u16) {
+fn btl_l2cap_listen(ch: &Channel, psm: u16) -> bool {
     let mut rep = [0u8; 16];
-    let _ = btl_rpc(ch, BtlOp::L2capListen, &psm.to_le_bytes(), 300, &mut rep);
+    btl_rpc(ch, BtlOp::L2capListen, &psm.to_le_bytes(), 1_500, &mut rep).is_ok()
 }
 
 fn btl_l2cap_accept(ch: &Channel, psm: u16) -> Result<(u16, u16, [u8; 6]), BtlStatus> {
     let mut rep = [0u8; 32];
-    let n = btl_rpc(ch, BtlOp::L2capAccept, &psm.to_le_bytes(), 50, &mut rep)?;
+    let n = btl_rpc(ch, BtlOp::L2capAccept, &psm.to_le_bytes(), 250, &mut rep)?;
     if n < 18 {
         return Err(BtlStatus::InvalidRequest);
     }
@@ -295,14 +306,14 @@ fn btl_l2cap_accept(ch: &Channel, psm: u16) -> Result<(u16, u16, [u8; 6]), BtlSt
 
 fn btl_l2cap_close(ch: &Channel, cid: u16) {
     let mut rep = [0u8; 16];
-    let _ = btl_rpc(ch, BtlOp::L2capClose, &cid.to_le_bytes(), 200, &mut rep);
+    let _ = btl_rpc(ch, BtlOp::L2capClose, &cid.to_le_bytes(), 500, &mut rep);
 }
 
 fn btl_set_coex_hint(ch: &Channel, streaming: bool) {
     let mut rep = [0u8; 16];
     // Profile `2` = high-priority A2DP streaming PTA weights; `0` = balanced.
     let profile = if streaming { 2u8 } else { 0u8 };
-    let _ = btl_rpc(ch, BtlOp::SetCoexHint, &[profile], 200, &mut rep);
+    let _ = btl_rpc(ch, BtlOp::SetCoexHint, &[profile], 500, &mut rep);
 }
 
 // ============================================================================
@@ -391,6 +402,7 @@ struct AudioRuntime {
     last_btl_autoconn_ms: u64,
     last_autoconn_fail_addr: [u8; 6],
     last_autoconn_fail_ms: u64,
+    btl_listeners_registered: bool,
 }
 
 impl AudioRuntime {
@@ -421,13 +433,25 @@ impl AudioRuntime {
             last_btl_autoconn_ms: 0,
             last_autoconn_fail_addr: [0; 6],
             last_autoconn_fail_ms: 0,
+            btl_listeners_registered: false,
         }
     }
 
     fn attach_btl_transport(&mut self, ch: Channel) {
-        btl_l2cap_listen(&ch, PSM_AVDTP);
-        btl_l2cap_listen(&ch, PSM_AVCTP);
         self.btl_ch = Some(ch);
+        self.btl_listeners_registered = false;
+    }
+
+    fn ensure_btl_listeners(&mut self) {
+        if self.btl_listeners_registered {
+            return;
+        }
+        let Some(ch) = self.btl_ch.as_ref() else {
+            return;
+        };
+        if btl_l2cap_listen(ch, PSM_AVDTP) && btl_l2cap_listen(ch, PSM_AVCTP) {
+            self.btl_listeners_registered = true;
+        }
     }
 
     fn attach_snd_driver(&mut self, ch: Channel) {
@@ -607,6 +631,7 @@ impl AudioRuntime {
             }
         }
         self.disconnect_btl_a2dp();
+        self.ensure_btl_listeners();
 
         let Some(btl_ch_check) = self.btl_ch.as_ref() else {
             return Err(AudioStatus::SinkUnavailable);
@@ -843,16 +868,20 @@ impl AudioRuntime {
             if self.route_mode == AudioRouteMode::VirtioOnly {
                 return;
             }
-            let inbound = self
-                .btl_ch
-                .as_ref()
-                .and_then(|ch| btl_l2cap_accept(ch, PSM_AVDTP).ok());
-            if let Some((scid, smtu, addr)) = inbound {
-                let _ = self.connect_btl_a2dp_inner(addr, Some((scid, smtu, addr)));
-                return;
-            }
             if now_ms.saturating_sub(self.last_btl_autoconn_ms) >= 2_000 {
                 self.last_btl_autoconn_ms = now_ms;
+                if !self.is_usb_bt_transport() {
+                    return;
+                }
+                self.ensure_btl_listeners();
+                let inbound = self
+                    .btl_ch
+                    .as_ref()
+                    .and_then(|ch| btl_l2cap_accept(ch, PSM_AVDTP).ok());
+                if let Some((scid, smtu, addr)) = inbound {
+                    let _ = self.connect_btl_a2dp_inner(addr, Some((scid, smtu, addr)));
+                    return;
+                }
                 let auto_addr = self.find_autoconnect_acl_peer(now_ms);
                 if let Some(addr) = auto_addr {
                     if self.connect_btl_a2dp(addr).is_err() {
@@ -962,19 +991,27 @@ impl AudioRuntime {
         }
     }
 
-    fn find_autoconnect_acl_peer(&self, now_ms: u64) -> Option<[u8; 6]> {
-        let ch = self.btl_ch.as_ref()?;
+    fn is_usb_bt_transport(&self) -> bool {
+        let Some(ch) = self.btl_ch.as_ref() else {
+            return false;
+        };
         let mut srep = [0u8; 64];
-        let sn = btl_rpc(ch, BtlOp::Status, &[], 150, &mut srep).ok()?;
-        let st = BtlStatusSnapshot::decode_reply(&srep[..sn]).ok()?;
-        if !matches!(
+        let Ok(sn) = btl_rpc(ch, BtlOp::Status, &[], 300, &mut srep) else {
+            return false;
+        };
+        let Ok(st) = BtlStatusSnapshot::decode_reply(&srep[..sn]) else {
+            return false;
+        };
+        matches!(
             st.transport,
             BtlTransportKind::UsbRealtek8821c | BtlTransportKind::UsbGenericHci
-        ) {
-            return None;
-        }
+        )
+    }
+
+    fn find_autoconnect_acl_peer(&self, now_ms: u64) -> Option<[u8; 6]> {
+        let ch = self.btl_ch.as_ref()?;
         let mut rep = [0u8; 1100];
-        let n = btl_rpc(ch, BtlOp::ListPeers, &[], 200, &mut rep).ok()?;
+        let n = btl_rpc(ch, BtlOp::ListPeers, &[], 400, &mut rep).ok()?;
         if n < 12 {
             return None;
         }
