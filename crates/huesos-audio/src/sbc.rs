@@ -704,7 +704,7 @@ impl<'a> MsbBitWriter<'a> {
             let shift = count - take;
             let mask = (1u32 << take) - 1;
             let chunk = ((value >> shift) & mask) as u8;
-            self.cur = (self.cur << take) | chunk;
+            self.cur = ((u16::from(self.cur) << take) as u8) | chunk;
             self.bit_rem -= take;
             count -= take;
             if self.bit_rem == 0 {
@@ -962,8 +962,8 @@ impl SbcEncoder {
                 for blk in 0..blocks {
                     let l = sb_samples[blk][0][sb];
                     let r = sb_samples[blk][1][sb];
-                    let mid = (l + r) >> 1;
-                    let side = (l - r) >> 1;
+                    let mid = ((i64::from(l) + i64::from(r)) >> 1) as i32;
+                    let side = ((i64::from(l) - i64::from(r)) >> 1) as i32;
                     mid_buf[blk] = mid;
                     side_buf[blk] = side;
                     let am = mid.unsigned_abs();
