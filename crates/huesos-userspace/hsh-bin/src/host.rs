@@ -341,7 +341,7 @@ fn command_uses_audio_service(resolved: &str) -> bool {
     let stem = strip_exec_ext(base);
     matches!(
         stem,
-        "audioctl" | "aplay" | "btop" | "hsh" | "std_smoke" | "std-smoke"
+        "btctl" | "audioctl" | "aplay" | "btop" | "hsh" | "std_smoke" | "std-smoke"
     )
 }
 

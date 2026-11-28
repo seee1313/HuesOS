@@ -14,6 +14,7 @@ extern crate alloc;
 use alloc::format;
 
 use huesos_coreutils as cu;
+use huesos_std::audio;
 use huesos_std::fs;
 use huesos_std::net;
 
@@ -224,6 +225,16 @@ fn run() -> i32 {
                         net::format_bd_addr(&addr),
                         handle
                     ));
+                    if audio::connect_btl_sink(Some(addr)).is_ok() {
+                        if let Ok(st) = audio::status() {
+                            cu::outln(&format!(
+                                "btctl: A2DP audio ready (SBC bitpool={}, {} kbps)",
+                                st.btl_sbc_bitpool, st.btl_bitrate_kbps
+                            ));
+                        } else {
+                            cu::outln("btctl: A2DP audio ready");
+                        }
+                    }
                     0
                 }
                 Err(e) => {
@@ -237,6 +248,7 @@ fn run() -> i32 {
                 cu::errln("btctl: usage: btctl disconnect <AA:BB:CC:DD:EE:FF>");
                 return 1;
             };
+            let _ = audio::disconnect_btl_sink();
             match net::btl_disconnect_acl(addr) {
                 Ok(()) => {
                     cu::outln(&format!(

@@ -2701,7 +2701,7 @@ impl XhciController {
     }
 
     async fn bt_send_acl_async(&self, slot_id: u8, acl: &[u8]) -> Result<(), UsbError> {
-        if acl.is_empty() || acl.len() > 1024 {
+        if acl.is_empty() || acl.len() > usize::from(BT_ACL_XFER_LEN) {
             return Err(UsbError::DescriptorInvalid);
         }
         let d_idx = usize::from(slot_id.saturating_sub(1));
